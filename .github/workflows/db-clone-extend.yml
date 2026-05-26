@@ -41,22 +41,22 @@ jobs:
 
           # Must contain -clone-
           if [[ "$CLUSTER" != *"-clone-"* ]]; then
-            echo "❌ Cluster name must contain '-clone-'"
+            echo "ERROR: Cluster name must contain '-clone-'"
             exit 1
           fi
 
           # Validate extend hours
           if [ "$EXTEND_HOURS" -gt 48 ]; then
-            echo "❌ Cannot extend more than 48 hours from now. Got: $EXTEND_HOURS"
+            echo "ERROR: Cannot extend more than 48 hours from now. Got: $EXTEND_HOURS"
             exit 1
           fi
 
           if [ "$EXTEND_HOURS" -lt 1 ]; then
-            echo "❌ Extension must be at least 1 hour. Got: $EXTEND_HOURS"
+            echo "ERROR: Extension must be at least 1 hour. Got: $EXTEND_HOURS"
             exit 1
           fi
 
-          echo "✅ Inputs validated"
+          echo "Inputs validated"
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -76,11 +76,11 @@ jobs:
             --output text 2>/dev/null)
 
           if [ -z "$STATUS" ] || [ "$STATUS" = "None" ]; then
-            echo "❌ Cluster not found: $CLUSTER"
+            echo "ERROR: Cluster not found: $CLUSTER"
             exit 1
           fi
 
-          echo "✅ Cluster found. Status: $STATUS"
+          echo "Cluster found. Status: $STATUS"
 
       - name: Update Expiry Tag
         run: |
@@ -98,7 +98,7 @@ jobs:
             --query 'DBClusters[0].DBClusterArn' \
             --output text)
 
-          echo "📝 Updating Expiry tag..."
+          echo "Updating Expiry tag..."
           echo "   New Expiry: $NEW_EXPIRY"
 
           aws rds add-tags-to-resource \
@@ -120,7 +120,7 @@ jobs:
               --tags Key=Expiry,Value="$NEW_EXPIRY"
           done
 
-          echo "✅ TTL Extended!"
+          echo "TTL Extended"
           echo "   Cluster: $CLUSTER"
           echo "   New Expiry: $NEW_EXPIRY"
           echo "   Extended by: ${{ github.actor }}"

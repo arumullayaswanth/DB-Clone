@@ -1,0 +1,37 @@
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Node modules (if any scripts added later)
+node_modules/
+
+# Terraform state (if IaC added later)
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Personal docs
+yash.md

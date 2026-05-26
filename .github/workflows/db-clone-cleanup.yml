@@ -36,7 +36,7 @@ jobs:
           REGION="${{ matrix.region }}"
           CURRENT_TIME=$(date -u +%s)
 
-          echo "🔍 Scanning for expired clones in $REGION..."
+          echo "Scanning for expired clones in $REGION..."
           echo "   Current time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           # Find all clusters managed by db-clone-system
@@ -78,20 +78,20 @@ jobs:
               --output text)
 
             if [ -z "$EXPIRY_TAG" ] || [ "$EXPIRY_TAG" = "None" ]; then
-              echo "   ⚠️ $CLUSTER_ID: No Expiry tag, skipping"
+              echo "   WARNING: $CLUSTER_ID: No Expiry tag, skipping"
               continue
             fi
 
             # Compare times
             EXPIRY_EPOCH=$(date -u -d "$EXPIRY_TAG" +%s 2>/dev/null)
             if [ -z "$EXPIRY_EPOCH" ]; then
-              echo "   ⚠️ $CLUSTER_ID: Invalid Expiry format: $EXPIRY_TAG"
+              echo "   WARNING: $CLUSTER_ID: Invalid Expiry format: $EXPIRY_TAG"
               continue
             fi
 
             if [ "$CURRENT_TIME" -gt "$EXPIRY_EPOCH" ]; then
-              echo "   🔴 EXPIRED: $CLUSTER_ID (expired at $EXPIRY_TAG)"
-              echo "   🗑️ Destroying..."
+              echo "   EXPIRED: $CLUSTER_ID (expired at $EXPIRY_TAG)"
+              echo "   Destroying..."
 
               # Delete instances first
               INSTANCES=$(aws rds describe-db-instances \
@@ -122,15 +122,15 @@ jobs:
                 --db-cluster-identifier "$CLUSTER_ID" \
                 --skip-final-snapshot || true
 
-              echo "   ✅ Destroyed: $CLUSTER_ID"
+              echo "   Destroyed: $CLUSTER_ID"
             else
               REMAINING=$(( (EXPIRY_EPOCH - CURRENT_TIME) / 3600 ))
-              echo "   🟢 ACTIVE: $CLUSTER_ID (${REMAINING}h remaining)"
+              echo "   ACTIVE: $CLUSTER_ID (${REMAINING}h remaining)"
             fi
           done
 
           echo ""
-          echo "✅ Cleanup scan complete for $REGION"
+          echo "Cleanup scan complete for $REGION"
 
       - name: Notify Slack on Cleanup
         if: ${{ vars.SLACK_WEBHOOK_URL != '' }}
@@ -138,5 +138,5 @@ jobs:
           curl -X POST "${{ vars.SLACK_WEBHOOK_URL }}" \
             -H 'Content-type: application/json' \
             -d '{
-              "text": "🧹 DB Clone TTL Cleanup completed for region: ${{ matrix.region }}"
+              "text": "DB Clone TTL Cleanup completed for region: ${{ matrix.region }}"
             }' || true

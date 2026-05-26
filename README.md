@@ -1,4 +1,4 @@
-# 🚀 DB Clone System
+# DB Clone System
 
 A self-service, safe, and automated system for developers to create temporary copies of production databases for testing.
 
@@ -14,34 +14,34 @@ The clone is automatically destroyed when the PR closes or TTL expires.
 
 ---
 
-## 🔁 Full Lifecycle
+## Full Lifecycle
 
 ```
 Developer edits config.yaml
-        ↓
+        |
 PR opened (feature/db-clone-request)
-        ↓
+        |
 Approval Gate (SRE reviews)
-        ↓
+        |
 Create workflow runs
-        ↓
+        |
 AWS Clone created + tagged
-        ↓
+        |
 Endpoint returned (PR comment + Slack)
-        ↓
+        |
 Developer uses DB
-        ↓
+        |
 (Optional: extend TTL)
-        ↓
+        |
 Cleanup happens:
-├── Manual destroy
-├── PR closed (auto)
-└── TTL expired (scheduled)
++-- Manual destroy
++-- PR closed (auto)
++-- TTL expired (scheduled)
 ```
 
 ---
 
-## 📋 How to Request a Clone
+## How to Request a Clone
 
 1. Create a new branch: `feature/db-clone-request`
 2. Edit `db-clone/config.yaml`:
@@ -58,7 +58,7 @@ ttl_hours: 24
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 | Field | Description | Constraints |
 |-------|-------------|-------------|
@@ -68,7 +68,7 @@ ttl_hours: 24
 
 ---
 
-## 🔐 Approval Gate
+## Approval Gate
 
 The `db-approval` GitHub Environment must be configured with:
 - **Required reviewers**: SRE team members (e.g., Emmett)
@@ -78,7 +78,7 @@ This ensures no clone is created without explicit approval.
 
 ---
 
-## 🏷️ Tagging Strategy
+## Tagging Strategy
 
 Every clone is tagged with:
 
@@ -93,7 +93,7 @@ Every clone is tagged with:
 
 ---
 
-## 📂 Workflows
+## Workflows
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
@@ -105,7 +105,7 @@ Every clone is tagged with:
 
 ---
 
-## 🛡️ Safety Features
+## Safety Features
 
 1. **Approval gate** - No clone without SRE sign-off
 2. **TTL enforcement** - Max 48 hours, auto-cleanup
@@ -116,7 +116,7 @@ Every clone is tagged with:
 
 ---
 
-## 🔧 Setup Requirements
+## Setup Requirements
 
 ### GitHub Secrets
 - `AWS_ROLE_ARN` - IAM role with RDS permissions
@@ -147,7 +147,7 @@ Every clone is tagged with:
 
 ---
 
-## 🚨 Troubleshooting
+## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|

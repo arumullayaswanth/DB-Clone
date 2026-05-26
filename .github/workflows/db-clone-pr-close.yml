@@ -45,7 +45,7 @@ jobs:
           REGION="${{ steps.config.outputs.region }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          echo "🔍 Searching for clones tagged with PR=$PR_NUMBER..."
+          echo "Searching for clones tagged with PR=$PR_NUMBER..."
 
           # Find clusters with matching PR tag
           CLUSTERS=$(aws rds describe-db-clusters \
@@ -69,13 +69,13 @@ jobs:
 
             if [ "$PR_TAG" = "$PR_NUMBER" ]; then
               CLONE_FOUND="$CLUSTER"
-              echo "✅ Found clone: $CLUSTER"
+              echo "Found clone: $CLUSTER"
               break
             fi
           done
 
           if [ -z "$CLONE_FOUND" ]; then
-            echo "ℹ️ No clone found for PR #$PR_NUMBER. May have been already destroyed."
+            echo "No clone found for PR #$PR_NUMBER. May have been already destroyed."
             echo "found=false" >> $GITHUB_OUTPUT
           else
             echo "clone_name=$CLONE_FOUND" >> $GITHUB_OUTPUT
@@ -88,7 +88,7 @@ jobs:
           CLUSTER="${{ steps.find_clone.outputs.clone_name }}"
           REGION="${{ steps.config.outputs.region }}"
 
-          echo "🗑️ Deleting instances for cluster: $CLUSTER"
+          echo "Deleting instances for cluster: $CLUSTER"
 
           INSTANCES=$(aws rds describe-db-instances \
             --region "$REGION" \
@@ -105,13 +105,13 @@ jobs:
           done
 
           for INSTANCE in $INSTANCES; do
-            echo "   ⏳ Waiting: $INSTANCE"
+            echo "   Waiting: $INSTANCE"
             aws rds wait db-instance-deleted \
               --region "$REGION" \
               --db-instance-identifier "$INSTANCE" || true
           done
 
-          echo "✅ Instances deleted"
+          echo "Instances deleted"
 
       - name: Delete DB Cluster
         if: steps.find_clone.outputs.found == 'true'
@@ -119,7 +119,7 @@ jobs:
           CLUSTER="${{ steps.find_clone.outputs.clone_name }}"
           REGION="${{ steps.config.outputs.region }}"
 
-          echo "🗑️ Deleting cluster: $CLUSTER"
+          echo "Deleting cluster: $CLUSTER"
 
           aws rds delete-db-cluster \
             --region "$REGION" \
@@ -130,7 +130,7 @@ jobs:
             --region "$REGION" \
             --db-cluster-identifier "$CLUSTER" || true
 
-          echo "✅ Cluster deleted"
+          echo "Cluster deleted"
 
       - name: Comment on PR
         if: steps.find_clone.outputs.found == 'true'
@@ -138,7 +138,7 @@ jobs:
         with:
           script: |
             const cloneName = '${{ steps.find_clone.outputs.clone_name }}';
-            const body = `## 🧹 DB Clone Destroyed
+            const body = `## DB Clone Destroyed
 
             | Property | Value |
             |----------|-------|

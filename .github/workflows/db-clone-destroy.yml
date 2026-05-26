@@ -34,17 +34,17 @@ jobs:
           CLUSTER="${{ inputs.cluster_name }}"
           REGION="${{ inputs.region }}"
 
-          echo "🛡️ Running safety checks..."
+          echo "Running safety checks..."
 
           # Must contain -clone-
           if [[ "$CLUSTER" != *"-clone-"* ]]; then
-            echo "❌ SAFETY: Cluster name must contain '-clone-'"
+            echo "SAFETY ERROR: Cluster name must contain '-clone-'"
             echo "   Got: $CLUSTER"
             echo "   This prevents accidental deletion of production databases."
             exit 1
           fi
 
-          echo "✅ Cluster name contains '-clone-'"
+          echo "Cluster name contains '-clone-'"
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -57,7 +57,7 @@ jobs:
           CLUSTER="${{ inputs.cluster_name }}"
           REGION="${{ inputs.region }}"
 
-          echo "🏷️ Validating tags..."
+          echo "Validating tags..."
 
           # Get cluster ARN
           CLUSTER_ARN=$(aws rds describe-db-clusters \
@@ -67,7 +67,7 @@ jobs:
             --output text 2>/dev/null)
 
           if [ -z "$CLUSTER_ARN" ] || [ "$CLUSTER_ARN" = "None" ]; then
-            echo "❌ Cluster not found: $CLUSTER"
+            echo "ERROR: Cluster not found: $CLUSTER"
             exit 1
           fi
 
@@ -79,7 +79,7 @@ jobs:
             --output text)
 
           if [ "$PLATFORM_TAG" != "developer-tools" ]; then
-            echo "❌ SAFETY: Cluster missing Platform=developer-tools tag"
+            echo "SAFETY ERROR: Cluster missing Platform=developer-tools tag"
             echo "   This is not a managed clone. Aborting."
             exit 1
           fi
@@ -92,12 +92,12 @@ jobs:
             --output text)
 
           if [ -z "$EXPIRY_TAG" ] || [ "$EXPIRY_TAG" = "None" ]; then
-            echo "❌ SAFETY: Cluster missing Expiry tag"
+            echo "SAFETY ERROR: Cluster missing Expiry tag"
             echo "   This is not a managed clone. Aborting."
             exit 1
           fi
 
-          echo "✅ All tag validations passed"
+          echo "All tag validations passed"
           echo "   Platform: $PLATFORM_TAG"
           echo "   Expiry: $EXPIRY_TAG"
 
@@ -106,7 +106,7 @@ jobs:
           CLUSTER="${{ inputs.cluster_name }}"
           REGION="${{ inputs.region }}"
 
-          echo "🗑️ Finding and deleting instances..."
+          echo "Finding and deleting instances..."
 
           INSTANCES=$(aws rds describe-db-instances \
             --region "$REGION" \
@@ -124,36 +124,36 @@ jobs:
 
           # Wait for instances to be deleted
           for INSTANCE in $INSTANCES; do
-            echo "   ⏳ Waiting for instance deletion: $INSTANCE"
+            echo "   Waiting for instance deletion: $INSTANCE"
             aws rds wait db-instance-deleted \
               --region "$REGION" \
               --db-instance-identifier "$INSTANCE" || true
           done
 
-          echo "✅ All instances deleted"
+          echo "All instances deleted"
 
       - name: Delete DB Cluster
         run: |
           CLUSTER="${{ inputs.cluster_name }}"
           REGION="${{ inputs.region }}"
 
-          echo "🗑️ Deleting cluster: $CLUSTER"
+          echo "Deleting cluster: $CLUSTER"
 
           aws rds delete-db-cluster \
             --region "$REGION" \
             --db-cluster-identifier "$CLUSTER" \
             --skip-final-snapshot
 
-          echo "⏳ Waiting for cluster deletion..."
+          echo "Waiting for cluster deletion..."
           aws rds wait db-cluster-deleted \
             --region "$REGION" \
             --db-cluster-identifier "$CLUSTER" || true
 
-          echo "✅ Cluster deleted: $CLUSTER"
+          echo "Cluster deleted: $CLUSTER"
 
       - name: Summary
         run: |
-          echo "🎉 DB Clone destroyed successfully!"
+          echo "DB Clone destroyed successfully"
           echo "   Cluster: ${{ inputs.cluster_name }}"
           echo "   Region: ${{ inputs.region }}"
           echo "   Destroyed by: ${{ github.actor }}"
