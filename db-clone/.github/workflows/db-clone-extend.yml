@@ -1,0 +1,126 @@
+# =============================================================
+# DB Clone - Extend TTL
+# =============================================================
+# Manually triggered to extend the TTL of an existing clone.
+# Updates the Expiry tag with a new timestamp.
+# =============================================================
+
+name: "DB Clone - Extend"
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: "Clone cluster name"
+        required: true
+        type: string
+      region:
+        description: "AWS Region"
+        required: true
+        default: "us-east-1"
+        type: string
+      extend_hours:
+        description: "Hours to extend (max 48 from now)"
+        required: true
+        default: "24"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  extend-ttl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate Inputs
+        run: |
+          CLUSTER="${{ inputs.cluster_name }}"
+          EXTEND_HOURS="${{ inputs.extend_hours }}"
+
+          # Must contain -clone-
+          if [[ "$CLUSTER" != *"-clone-"* ]]; then
+            echo "❌ Cluster name must contain '-clone-'"
+            exit 1
+          fi
+
+          # Validate extend hours
+          if [ "$EXTEND_HOURS" -gt 48 ]; then
+            echo "❌ Cannot extend more than 48 hours from now. Got: $EXTEND_HOURS"
+            exit 1
+          fi
+
+          if [ "$EXTEND_HOURS" -lt 1 ]; then
+            echo "❌ Extension must be at least 1 hour. Got: $EXTEND_HOURS"
+            exit 1
+          fi
+
+          echo "✅ Inputs validated"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Verify Clone Exists
+        run: |
+          CLUSTER="${{ inputs.cluster_name }}"
+          REGION="${{ inputs.region }}"
+
+          STATUS=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLUSTER" \
+            --query 'DBClusters[0].Status' \
+            --output text 2>/dev/null)
+
+          if [ -z "$STATUS" ] || [ "$STATUS" = "None" ]; then
+            echo "❌ Cluster not found: $CLUSTER"
+            exit 1
+          fi
+
+          echo "✅ Cluster found. Status: $STATUS"
+
+      - name: Update Expiry Tag
+        run: |
+          CLUSTER="${{ inputs.cluster_name }}"
+          REGION="${{ inputs.region }}"
+          EXTEND_HOURS="${{ inputs.extend_hours }}"
+
+          # Calculate new expiry
+          NEW_EXPIRY=$(date -u -d "+${EXTEND_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ)
+
+          # Get cluster ARN
+          CLUSTER_ARN=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLUSTER" \
+            --query 'DBClusters[0].DBClusterArn' \
+            --output text)
+
+          echo "📝 Updating Expiry tag..."
+          echo "   New Expiry: $NEW_EXPIRY"
+
+          aws rds add-tags-to-resource \
+            --region "$REGION" \
+            --resource-name "$CLUSTER_ARN" \
+            --tags Key=Expiry,Value="$NEW_EXPIRY"
+
+          # Also update instances
+          INSTANCES=$(aws rds describe-db-instances \
+            --region "$REGION" \
+            --filters "Name=db-cluster-id,Values=$CLUSTER" \
+            --query 'DBInstances[].DBInstanceArn' \
+            --output text)
+
+          for INSTANCE_ARN in $INSTANCES; do
+            aws rds add-tags-to-resource \
+              --region "$REGION" \
+              --resource-name "$INSTANCE_ARN" \
+              --tags Key=Expiry,Value="$NEW_EXPIRY"
+          done
+
+          echo "✅ TTL Extended!"
+          echo "   Cluster: $CLUSTER"
+          echo "   New Expiry: $NEW_EXPIRY"
+          echo "   Extended by: ${{ github.actor }}"

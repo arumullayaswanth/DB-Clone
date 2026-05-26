@@ -1,0 +1,159 @@
+# =============================================================
+# DB Clone - Destroy (Manual)
+# =============================================================
+# Manually triggered to destroy a specific clone.
+# Includes safety checks to prevent accidental deletion.
+# =============================================================
+
+name: "DB Clone - Destroy"
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: "Clone cluster name (must contain '-clone-')"
+        required: true
+        type: string
+      region:
+        description: "AWS Region"
+        required: true
+        default: "us-east-1"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  destroy-clone:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Safety Checks
+        run: |
+          CLUSTER="${{ inputs.cluster_name }}"
+          REGION="${{ inputs.region }}"
+
+          echo "🛡️ Running safety checks..."
+
+          # Must contain -clone-
+          if [[ "$CLUSTER" != *"-clone-"* ]]; then
+            echo "❌ SAFETY: Cluster name must contain '-clone-'"
+            echo "   Got: $CLUSTER"
+            echo "   This prevents accidental deletion of production databases."
+            exit 1
+          fi
+
+          echo "✅ Cluster name contains '-clone-'"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Validate Tags
+        run: |
+          CLUSTER="${{ inputs.cluster_name }}"
+          REGION="${{ inputs.region }}"
+
+          echo "🏷️ Validating tags..."
+
+          # Get cluster ARN
+          CLUSTER_ARN=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLUSTER" \
+            --query 'DBClusters[0].DBClusterArn' \
+            --output text 2>/dev/null)
+
+          if [ -z "$CLUSTER_ARN" ] || [ "$CLUSTER_ARN" = "None" ]; then
+            echo "❌ Cluster not found: $CLUSTER"
+            exit 1
+          fi
+
+          # Check Platform tag
+          PLATFORM_TAG=$(aws rds list-tags-for-resource \
+            --region "$REGION" \
+            --resource-name "$CLUSTER_ARN" \
+            --query "TagList[?Key=='Platform'].Value" \
+            --output text)
+
+          if [ "$PLATFORM_TAG" != "developer-tools" ]; then
+            echo "❌ SAFETY: Cluster missing Platform=developer-tools tag"
+            echo "   This is not a managed clone. Aborting."
+            exit 1
+          fi
+
+          # Check Expiry tag exists
+          EXPIRY_TAG=$(aws rds list-tags-for-resource \
+            --region "$REGION" \
+            --resource-name "$CLUSTER_ARN" \
+            --query "TagList[?Key=='Expiry'].Value" \
+            --output text)
+
+          if [ -z "$EXPIRY_TAG" ] || [ "$EXPIRY_TAG" = "None" ]; then
+            echo "❌ SAFETY: Cluster missing Expiry tag"
+            echo "   This is not a managed clone. Aborting."
+            exit 1
+          fi
+
+          echo "✅ All tag validations passed"
+          echo "   Platform: $PLATFORM_TAG"
+          echo "   Expiry: $EXPIRY_TAG"
+
+      - name: Delete DB Instances
+        run: |
+          CLUSTER="${{ inputs.cluster_name }}"
+          REGION="${{ inputs.region }}"
+
+          echo "🗑️ Finding and deleting instances..."
+
+          INSTANCES=$(aws rds describe-db-instances \
+            --region "$REGION" \
+            --filters "Name=db-cluster-id,Values=$CLUSTER" \
+            --query 'DBInstances[].DBInstanceIdentifier' \
+            --output text)
+
+          for INSTANCE in $INSTANCES; do
+            echo "   Deleting instance: $INSTANCE"
+            aws rds delete-db-instance \
+              --region "$REGION" \
+              --db-instance-identifier "$INSTANCE" \
+              --skip-final-snapshot
+          done
+
+          # Wait for instances to be deleted
+          for INSTANCE in $INSTANCES; do
+            echo "   ⏳ Waiting for instance deletion: $INSTANCE"
+            aws rds wait db-instance-deleted \
+              --region "$REGION" \
+              --db-instance-identifier "$INSTANCE" || true
+          done
+
+          echo "✅ All instances deleted"
+
+      - name: Delete DB Cluster
+        run: |
+          CLUSTER="${{ inputs.cluster_name }}"
+          REGION="${{ inputs.region }}"
+
+          echo "🗑️ Deleting cluster: $CLUSTER"
+
+          aws rds delete-db-cluster \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLUSTER" \
+            --skip-final-snapshot
+
+          echo "⏳ Waiting for cluster deletion..."
+          aws rds wait db-cluster-deleted \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLUSTER" || true
+
+          echo "✅ Cluster deleted: $CLUSTER"
+
+      - name: Summary
+        run: |
+          echo "🎉 DB Clone destroyed successfully!"
+          echo "   Cluster: ${{ inputs.cluster_name }}"
+          echo "   Region: ${{ inputs.region }}"
+          echo "   Destroyed by: ${{ github.actor }}"

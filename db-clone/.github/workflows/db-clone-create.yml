@@ -1,0 +1,314 @@
+# =============================================================
+# DB Clone - Create
+# =============================================================
+# Triggered when a PR modifies db-clone/config.yaml
+# Requires manual approval via the "db-approval" environment
+# =============================================================
+
+name: "DB Clone - Create"
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - "db-clone/config.yaml"
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  create-clone:
+    runs-on: ubuntu-latest
+    environment: db-approval # 🔐 Requires manual approval from SRE/Approver
+
+    steps:
+      # -------------------------------------------
+      # 3.1 Parse Config
+      # -------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse Config
+        id: config
+        run: |
+          CONFIG_FILE="db-clone/config.yaml"
+
+          REGION=$(grep '^region:' "$CONFIG_FILE" | awk '{print $2}')
+          SOURCE_DB=$(grep '^source_db:' "$CONFIG_FILE" | awk '{print $2}')
+          TTL_HOURS=$(grep '^ttl_hours:' "$CONFIG_FILE" | awk '{print $2}')
+
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "source_db=$SOURCE_DB" >> $GITHUB_OUTPUT
+          echo "ttl_hours=$TTL_HOURS" >> $GITHUB_OUTPUT
+
+          echo "📋 Parsed Config:"
+          echo "  Region: $REGION"
+          echo "  Source DB: $SOURCE_DB"
+          echo "  TTL Hours: $TTL_HOURS"
+
+      # -------------------------------------------
+      # 3.2 Validate Inputs
+      # -------------------------------------------
+      - name: Validate Inputs
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          SOURCE_DB="${{ steps.config.outputs.source_db }}"
+          TTL_HOURS="${{ steps.config.outputs.ttl_hours }}"
+
+          # Check fields exist
+          if [ -z "$REGION" ] || [ -z "$SOURCE_DB" ] || [ -z "$TTL_HOURS" ]; then
+            echo "❌ ERROR: Missing required fields in config.yaml"
+            echo "Required: region, source_db, ttl_hours"
+            exit 1
+          fi
+
+          # Validate TTL <= 48 hours
+          if [ "$TTL_HOURS" -gt 48 ]; then
+            echo "❌ ERROR: TTL cannot exceed 48 hours. Got: $TTL_HOURS"
+            exit 1
+          fi
+
+          if [ "$TTL_HOURS" -lt 1 ]; then
+            echo "❌ ERROR: TTL must be at least 1 hour. Got: $TTL_HOURS"
+            exit 1
+          fi
+
+          # Validate region format (e.g., us-east-1)
+          if ! echo "$REGION" | grep -qE '^[a-z]{2}-[a-z]+-[0-9]+$'; then
+            echo "❌ ERROR: Invalid region format: $REGION"
+            exit 1
+          fi
+
+          # Validate source_db format
+          if ! echo "$SOURCE_DB" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9\-]+$'; then
+            echo "❌ ERROR: Invalid source_db format: $SOURCE_DB"
+            exit 1
+          fi
+
+          echo "✅ All validations passed"
+
+      # -------------------------------------------
+      # 3.3 Generate Clone Name
+      # -------------------------------------------
+      - name: Generate Clone Name
+        id: clone_name
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SOURCE_DB="${{ steps.config.outputs.source_db }}"
+          CLONE_NAME="${SOURCE_DB}-clone-${TIMESTAMP}"
+          INSTANCE_NAME="${CLONE_NAME}-instance-1"
+
+          echo "clone_name=$CLONE_NAME" >> $GITHUB_OUTPUT
+          echo "instance_name=$INSTANCE_NAME" >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+
+          echo "🧠 Generated Clone Name: $CLONE_NAME"
+          echo "🖥️ Instance Name: $INSTANCE_NAME"
+
+      # -------------------------------------------
+      # 3.4 Calculate Expiry
+      # -------------------------------------------
+      - name: Calculate Expiry
+        id: expiry
+        run: |
+          TTL_HOURS="${{ steps.config.outputs.ttl_hours }}"
+          EXPIRY=$(date -u -d "+${TTL_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ)
+          echo "expiry=$EXPIRY" >> $GITHUB_OUTPUT
+          echo "⏰ Clone will expire at: $EXPIRY"
+
+      # -------------------------------------------
+      # 3.5 AWS - Configure Credentials
+      # -------------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ steps.config.outputs.region }}
+
+      # -------------------------------------------
+      # 3.5 AWS - Create DB Cluster Clone
+      # -------------------------------------------
+      - name: Create DB Cluster Clone
+        id: create_cluster
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          SOURCE_DB="${{ steps.config.outputs.source_db }}"
+          CLONE_NAME="${{ steps.clone_name.outputs.clone_name }}"
+          EXPIRY="${{ steps.expiry.outputs.expiry }}"
+
+          echo "☁️ Creating RDS cluster clone: $CLONE_NAME"
+          echo "   Source: $SOURCE_DB"
+          echo "   Region: $REGION"
+
+          aws rds restore-db-cluster-to-point-in-time \
+            --region "$REGION" \
+            --source-db-cluster-identifier "$SOURCE_DB" \
+            --db-cluster-identifier "$CLONE_NAME" \
+            --restore-type copy-on-write \
+            --use-latest-restorable-time \
+            --tags \
+              Key=Platform,Value=developer-tools \
+              Key=Requester,Value=${{ github.actor }} \
+              Key=PR,Value=${{ github.event.pull_request.number }} \
+              Key=Expiry,Value="$EXPIRY" \
+              Key=SourceDB,Value="$SOURCE_DB" \
+              Key=ManagedBy,Value=db-clone-system
+
+          echo "✅ Cluster clone initiated: $CLONE_NAME"
+
+      # -------------------------------------------
+      # 3.6 Create DB Instance
+      # -------------------------------------------
+      - name: Create DB Instance
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          CLONE_NAME="${{ steps.clone_name.outputs.clone_name }}"
+          INSTANCE_NAME="${{ steps.clone_name.outputs.instance_name }}"
+          EXPIRY="${{ steps.expiry.outputs.expiry }}"
+          INSTANCE_CLASS="db.r5.large"
+
+          echo "🖥️ Creating DB instance: $INSTANCE_NAME"
+
+          aws rds create-db-instance \
+            --region "$REGION" \
+            --db-instance-identifier "$INSTANCE_NAME" \
+            --db-cluster-identifier "$CLONE_NAME" \
+            --db-instance-class "$INSTANCE_CLASS" \
+            --engine aurora-mysql \
+            --tags \
+              Key=Platform,Value=developer-tools \
+              Key=Requester,Value=${{ github.actor }} \
+              Key=PR,Value=${{ github.event.pull_request.number }} \
+              Key=Expiry,Value="$EXPIRY" \
+              Key=ManagedBy,Value=db-clone-system
+
+          echo "✅ Instance creation initiated: $INSTANCE_NAME"
+
+      # -------------------------------------------
+      # 3.7 Wait Until Ready
+      # -------------------------------------------
+      - name: Wait for Cluster Available
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          CLONE_NAME="${{ steps.clone_name.outputs.clone_name }}"
+
+          echo "⏳ Waiting for cluster to become available..."
+          aws rds wait db-cluster-available \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLONE_NAME"
+          echo "✅ Cluster is available"
+
+      - name: Wait for Instance Available
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          INSTANCE_NAME="${{ steps.clone_name.outputs.instance_name }}"
+
+          echo "⏳ Waiting for instance to become available..."
+          aws rds wait db-instance-available \
+            --region "$REGION" \
+            --db-instance-identifier "$INSTANCE_NAME"
+          echo "✅ Instance is available"
+
+      # -------------------------------------------
+      # 3.8 Fetch Endpoint
+      # -------------------------------------------
+      - name: Fetch Endpoint
+        id: endpoint
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          CLONE_NAME="${{ steps.clone_name.outputs.clone_name }}"
+
+          ENDPOINT=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLONE_NAME" \
+            --query 'DBClusters[0].Endpoint' \
+            --output text)
+
+          PORT=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLONE_NAME" \
+            --query 'DBClusters[0].Port' \
+            --output text)
+
+          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "port=$PORT" >> $GITHUB_OUTPUT
+
+          echo "🌐 Endpoint: $ENDPOINT:$PORT"
+
+      # -------------------------------------------
+      # 3.9 Notify - PR Comment
+      # -------------------------------------------
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cloneName = '${{ steps.clone_name.outputs.clone_name }}';
+            const endpoint = '${{ steps.endpoint.outputs.endpoint }}';
+            const port = '${{ steps.endpoint.outputs.port }}';
+            const ttl = '${{ steps.config.outputs.ttl_hours }}';
+            const expiry = '${{ steps.expiry.outputs.expiry }}';
+            const region = '${{ steps.config.outputs.region }}';
+            const sourceDb = '${{ steps.config.outputs.source_db }}';
+
+            const body = `## 🚀 DB Clone Ready!
+
+            | Property | Value |
+            |----------|-------|
+            | **Cluster** | \`${cloneName}\` |
+            | **Endpoint** | \`${endpoint}:${port}\` |
+            | **Source** | \`${sourceDb}\` |
+            | **Region** | \`${region}\` |
+            | **TTL** | ${ttl} hours |
+            | **Expires** | ${expiry} |
+            | **Requester** | @${{ github.actor }} |
+
+            ### 🔗 Connection
+            \`\`\`
+            mysql -h ${endpoint} -P ${port} -u <username> -p
+            \`\`\`
+
+            ### ⚠️ Notes
+            - This clone will be **automatically destroyed** when this PR is closed or TTL expires.
+            - To extend TTL, run the **DB Clone - Extend** workflow.
+            - To destroy manually, run the **DB Clone - Destroy** workflow.
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      # -------------------------------------------
+      # 3.9 Notify - Slack
+      # -------------------------------------------
+      - name: Notify Slack
+        if: ${{ vars.SLACK_WEBHOOK_URL != '' }}
+        run: |
+          curl -X POST "${{ vars.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            -d '{
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🚀 DB Clone Created"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": "*User:* ${{ github.actor }}"},
+                    {"type": "mrkdwn", "text": "*Cluster:* `${{ steps.clone_name.outputs.clone_name }}`"},
+                    {"type": "mrkdwn", "text": "*Endpoint:* `${{ steps.endpoint.outputs.endpoint }}`"},
+                    {"type": "mrkdwn", "text": "*TTL:* ${{ steps.config.outputs.ttl_hours }}h"},
+                    {"type": "mrkdwn", "text": "*PR:* #${{ github.event.pull_request.number }}"},
+                    {"type": "mrkdwn", "text": "*Region:* ${{ steps.config.outputs.region }}"}
+                  ]
+                }
+              ]
+            }'

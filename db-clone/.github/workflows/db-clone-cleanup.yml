@@ -1,0 +1,142 @@
+# =============================================================
+# DB Clone - TTL Cleanup (Scheduled)
+# =============================================================
+# Runs on a schedule to find and destroy expired clones.
+# Checks the Expiry tag against current time.
+# =============================================================
+
+name: "DB Clone - TTL Cleanup"
+
+on:
+  schedule:
+    # Run every 2 hours
+    - cron: "0 */2 * * *"
+  workflow_dispatch: # Allow manual trigger for testing
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cleanup-expired:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        region: [us-east-1, us-west-2, eu-west-1] # Add regions as needed
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Find and Destroy Expired Clones
+        run: |
+          REGION="${{ matrix.region }}"
+          CURRENT_TIME=$(date -u +%s)
+
+          echo "🔍 Scanning for expired clones in $REGION..."
+          echo "   Current time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Find all clusters managed by db-clone-system
+          CLUSTERS=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --query "DBClusters[?contains(DBClusterIdentifier, 'clone')].{Id:DBClusterIdentifier,Arn:DBClusterArn}" \
+            --output json)
+
+          echo "$CLUSTERS" | jq -c '.[]' | while read -r CLUSTER_JSON; do
+            CLUSTER_ID=$(echo "$CLUSTER_JSON" | jq -r '.Id')
+            CLUSTER_ARN=$(echo "$CLUSTER_JSON" | jq -r '.Arn')
+
+            # Check if managed by our system
+            PLATFORM_TAG=$(aws rds list-tags-for-resource \
+              --region "$REGION" \
+              --resource-name "$CLUSTER_ARN" \
+              --query "TagList[?Key=='Platform'].Value" \
+              --output text)
+
+            if [ "$PLATFORM_TAG" != "developer-tools" ]; then
+              continue
+            fi
+
+            MANAGED_BY=$(aws rds list-tags-for-resource \
+              --region "$REGION" \
+              --resource-name "$CLUSTER_ARN" \
+              --query "TagList[?Key=='ManagedBy'].Value" \
+              --output text)
+
+            if [ "$MANAGED_BY" != "db-clone-system" ]; then
+              continue
+            fi
+
+            # Get expiry
+            EXPIRY_TAG=$(aws rds list-tags-for-resource \
+              --region "$REGION" \
+              --resource-name "$CLUSTER_ARN" \
+              --query "TagList[?Key=='Expiry'].Value" \
+              --output text)
+
+            if [ -z "$EXPIRY_TAG" ] || [ "$EXPIRY_TAG" = "None" ]; then
+              echo "   ⚠️ $CLUSTER_ID: No Expiry tag, skipping"
+              continue
+            fi
+
+            # Compare times
+            EXPIRY_EPOCH=$(date -u -d "$EXPIRY_TAG" +%s 2>/dev/null)
+            if [ -z "$EXPIRY_EPOCH" ]; then
+              echo "   ⚠️ $CLUSTER_ID: Invalid Expiry format: $EXPIRY_TAG"
+              continue
+            fi
+
+            if [ "$CURRENT_TIME" -gt "$EXPIRY_EPOCH" ]; then
+              echo "   🔴 EXPIRED: $CLUSTER_ID (expired at $EXPIRY_TAG)"
+              echo "   🗑️ Destroying..."
+
+              # Delete instances first
+              INSTANCES=$(aws rds describe-db-instances \
+                --region "$REGION" \
+                --filters "Name=db-cluster-id,Values=$CLUSTER_ID" \
+                --query 'DBInstances[].DBInstanceIdentifier' \
+                --output text)
+
+              for INSTANCE in $INSTANCES; do
+                echo "      Deleting instance: $INSTANCE"
+                aws rds delete-db-instance \
+                  --region "$REGION" \
+                  --db-instance-identifier "$INSTANCE" \
+                  --skip-final-snapshot || true
+              done
+
+              # Wait for instances
+              for INSTANCE in $INSTANCES; do
+                aws rds wait db-instance-deleted \
+                  --region "$REGION" \
+                  --db-instance-identifier "$INSTANCE" 2>/dev/null || true
+              done
+
+              # Delete cluster
+              echo "      Deleting cluster: $CLUSTER_ID"
+              aws rds delete-db-cluster \
+                --region "$REGION" \
+                --db-cluster-identifier "$CLUSTER_ID" \
+                --skip-final-snapshot || true
+
+              echo "   ✅ Destroyed: $CLUSTER_ID"
+            else
+              REMAINING=$(( (EXPIRY_EPOCH - CURRENT_TIME) / 3600 ))
+              echo "   🟢 ACTIVE: $CLUSTER_ID (${REMAINING}h remaining)"
+            fi
+          done
+
+          echo ""
+          echo "✅ Cleanup scan complete for $REGION"
+
+      - name: Notify Slack on Cleanup
+        if: ${{ vars.SLACK_WEBHOOK_URL != '' }}
+        run: |
+          curl -X POST "${{ vars.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            -d '{
+              "text": "🧹 DB Clone TTL Cleanup completed for region: ${{ matrix.region }}"
+            }' || true

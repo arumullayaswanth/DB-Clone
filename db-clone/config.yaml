@@ -1,0 +1,10 @@
+# =============================================================
+# DB Clone Configuration
+# =============================================================
+# Developers: Edit this file and open a PR to request a clone.
+# A reviewer (SRE/Approver) must approve before the clone is created.
+# =============================================================
+
+region: us-east-1
+source_db: cm-mysql-cluster-prd-us-emailtrack
+ttl_hours: 24
