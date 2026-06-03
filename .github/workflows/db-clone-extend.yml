@@ -2,6 +2,7 @@
 # DB Clone - Extend TTL
 # =============================================================
 # Manually triggered to extend the TTL of an existing clone.
+# Supports both Aurora clusters and RDS instances.
 # Updates the Expiry tag with a new timestamp.
 # =============================================================
 
@@ -10,15 +11,23 @@ name: "DB Clone - Extend"
 on:
   workflow_dispatch:
     inputs:
-      cluster_name:
-        description: "Clone cluster name"
+      clone_name:
+        description: "Clone name (cluster or instance)"
         required: true
         type: string
       region:
         description: "AWS Region"
         required: true
-        default: "us-east-1"
+        default: "ca-central-1"
         type: string
+      source_type:
+        description: "Source type"
+        required: true
+        default: "aurora-cluster"
+        type: choice
+        options:
+          - aurora-cluster
+          - rds-instance
       extend_hours:
         description: "Hours to extend (max 48 from now)"
         required: true
@@ -32,16 +41,17 @@ permissions:
 jobs:
   extend-ttl:
     runs-on: ubuntu-latest
+    environment: db-approval
 
     steps:
       - name: Validate Inputs
         run: |
-          CLUSTER="${{ inputs.cluster_name }}"
+          CLONE="${{ inputs.clone_name }}"
           EXTEND_HOURS="${{ inputs.extend_hours }}"
 
           # Must contain -clone-
-          if [[ "$CLUSTER" != *"-clone-"* ]]; then
-            echo "ERROR: Cluster name must contain '-clone-'"
+          if [[ "$CLONE" != *"-clone-"* ]]; then
+            echo "ERROR: Name must contain '-clone-'"
             exit 1
           fi
 
@@ -64,79 +74,76 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ inputs.region }}
 
-      - name: Verify Clone Exists
+      - name: Verify Clone Exists and Validate Tags
+        id: verify
         run: |
-          CLUSTER="${{ inputs.cluster_name }}"
+          CLONE="${{ inputs.clone_name }}"
           REGION="${{ inputs.region }}"
+          SOURCE_TYPE="${{ inputs.source_type }}"
 
-          STATUS=$(aws rds describe-db-clusters \
-            --region "$REGION" \
-            --db-cluster-identifier "$CLUSTER" \
-            --query 'DBClusters[0].Status' \
-            --output text 2>/dev/null)
+          # Get ARN based on source type
+          if [ "$SOURCE_TYPE" = "aurora-cluster" ]; then
+            RESOURCE_ARN=$(aws rds describe-db-clusters \
+              --region "$REGION" \
+              --db-cluster-identifier "$CLONE" \
+              --query 'DBClusters[0].DBClusterArn' \
+              --output text 2>/dev/null)
+          else
+            RESOURCE_ARN=$(aws rds describe-db-instances \
+              --region "$REGION" \
+              --db-instance-identifier "$CLONE" \
+              --query 'DBInstances[0].DBInstanceArn' \
+              --output text 2>/dev/null)
+          fi
 
-          if [ -z "$STATUS" ] || [ "$STATUS" = "None" ]; then
-            echo "ERROR: Cluster not found: $CLUSTER"
+          if [ -z "$RESOURCE_ARN" ] || [ "$RESOURCE_ARN" = "None" ]; then
+            echo "ERROR: Clone not found: $CLONE (type: $SOURCE_TYPE)"
             exit 1
           fi
 
-          echo "Cluster found. Status: $STATUS"
-
-      - name: Validate Tags
-        run: |
-          CLUSTER="${{ inputs.cluster_name }}"
-          REGION="${{ inputs.region }}"
-
-          # Get cluster ARN
-          CLUSTER_ARN=$(aws rds describe-db-clusters \
-            --region "$REGION" \
-            --db-cluster-identifier "$CLUSTER" \
-            --query 'DBClusters[0].DBClusterArn' \
-            --output text)
+          echo "resource_arn=$RESOURCE_ARN" >> $GITHUB_OUTPUT
+          echo "Clone found: $CLONE"
 
           # Check Platform tag
           PLATFORM_TAG=$(aws rds list-tags-for-resource \
             --region "$REGION" \
-            --resource-name "$CLUSTER_ARN" \
+            --resource-name "$RESOURCE_ARN" \
             --query "TagList[?Key=='Platform'].Value" \
             --output text)
 
           if [ "$PLATFORM_TAG" != "developer-tools" ]; then
-            echo "ERROR: Cluster missing Platform=developer-tools tag"
-            echo "   This is not a managed clone. Cannot extend."
+            echo "ERROR: Missing Platform=developer-tools tag. Cannot extend."
             exit 1
           fi
 
           # Check ManagedBy tag
           MANAGED_BY=$(aws rds list-tags-for-resource \
             --region "$REGION" \
-            --resource-name "$CLUSTER_ARN" \
+            --resource-name "$RESOURCE_ARN" \
             --query "TagList[?Key=='ManagedBy'].Value" \
             --output text)
 
           if [ "$MANAGED_BY" != "db-clone-system" ]; then
-            echo "ERROR: Cluster missing ManagedBy=db-clone-system tag"
-            echo "   This is not a managed clone. Cannot extend."
+            echo "ERROR: Missing ManagedBy=db-clone-system tag. Cannot extend."
             exit 1
           fi
 
           # Check Expiry tag exists
           EXPIRY_TAG=$(aws rds list-tags-for-resource \
             --region "$REGION" \
-            --resource-name "$CLUSTER_ARN" \
+            --resource-name "$RESOURCE_ARN" \
             --query "TagList[?Key=='Expiry'].Value" \
             --output text)
 
           if [ -z "$EXPIRY_TAG" ] || [ "$EXPIRY_TAG" = "None" ]; then
-            echo "ERROR: Cluster missing Expiry tag"
-            echo "   This is not a managed clone. Cannot extend."
+            echo "ERROR: Missing Expiry tag. Cannot extend."
             exit 1
           fi
 
-          # Check Requester matches current user (optional but recommended)
+          # Check Requester
           REQUESTER_TAG=$(aws rds list-tags-for-resource \
             --region "$REGION" \
-            --resource-name "$CLUSTER_ARN" \
+            --resource-name "$RESOURCE_ARN" \
             --query "TagList[?Key=='Requester'].Value" \
             --output text)
 
@@ -153,43 +160,42 @@ jobs:
 
       - name: Update Expiry Tag
         run: |
-          CLUSTER="${{ inputs.cluster_name }}"
+          CLONE="${{ inputs.clone_name }}"
           REGION="${{ inputs.region }}"
+          SOURCE_TYPE="${{ inputs.source_type }}"
           EXTEND_HOURS="${{ inputs.extend_hours }}"
+          RESOURCE_ARN="${{ steps.verify.outputs.resource_arn }}"
 
           # Calculate new expiry
           NEW_EXPIRY=$(date -u -d "+${EXTEND_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ)
 
-          # Get cluster ARN
-          CLUSTER_ARN=$(aws rds describe-db-clusters \
-            --region "$REGION" \
-            --db-cluster-identifier "$CLUSTER" \
-            --query 'DBClusters[0].DBClusterArn' \
-            --output text)
-
           echo "Updating Expiry tag..."
           echo "   New Expiry: $NEW_EXPIRY"
 
+          # Update main resource
           aws rds add-tags-to-resource \
             --region "$REGION" \
-            --resource-name "$CLUSTER_ARN" \
+            --resource-name "$RESOURCE_ARN" \
             --tags Key=Expiry,Value="$NEW_EXPIRY"
 
-          # Also update instances
-          INSTANCES=$(aws rds describe-db-instances \
-            --region "$REGION" \
-            --filters "Name=db-cluster-id,Values=$CLUSTER" \
-            --query 'DBInstances[].DBInstanceArn' \
-            --output text)
-
-          for INSTANCE_ARN in $INSTANCES; do
-            aws rds add-tags-to-resource \
+          # For Aurora clusters, also update instances
+          if [ "$SOURCE_TYPE" = "aurora-cluster" ]; then
+            INSTANCES=$(aws rds describe-db-instances \
               --region "$REGION" \
-              --resource-name "$INSTANCE_ARN" \
-              --tags Key=Expiry,Value="$NEW_EXPIRY"
-          done
+              --filters "Name=db-cluster-id,Values=$CLONE" \
+              --query 'DBInstances[].DBInstanceArn' \
+              --output text)
+
+            for INSTANCE_ARN in $INSTANCES; do
+              aws rds add-tags-to-resource \
+                --region "$REGION" \
+                --resource-name "$INSTANCE_ARN" \
+                --tags Key=Expiry,Value="$NEW_EXPIRY"
+            done
+          fi
 
           echo "TTL Extended"
-          echo "   Cluster: $CLUSTER"
+          echo "   Clone: $CLONE"
+          echo "   Type: $SOURCE_TYPE"
           echo "   New Expiry: $NEW_EXPIRY"
           echo "   Extended by: ${{ github.actor }}"

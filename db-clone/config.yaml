@@ -5,6 +5,8 @@
 # A reviewer (SRE/Approver) must approve before the clone is created.
 # =============================================================
 #
+# IMPORTANT: region must match where the source_db actually exists.
+#
 # source_type options:
 #   aurora-cluster  - Aurora MySQL / Aurora PostgreSQL (copy-on-write clone)
 #   rds-instance    - Standard RDS MySQL / PostgreSQL (snapshot + restore)
@@ -15,7 +17,7 @@
 #   db.t3.micro    - Lightweight debugging
 # =============================================================
 
-region: ca-central-1
+region: us-east-1
 source_db: cm-mysql-cluster-prd-us-emailtrack
 source_type: aurora-cluster
 ttl_hours: 24

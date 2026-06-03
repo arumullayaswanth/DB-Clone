@@ -123,8 +123,19 @@ jobs:
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           SOURCE_DB="${{ steps.config.outputs.source_db }}"
           CLONE_NAME="${SOURCE_DB}-clone-${TIMESTAMP}"
-          INSTANCE_NAME="${CLONE_NAME}-instance-1"
+          INSTANCE_NAME="${CLONE_NAME}-0"
           SNAPSHOT_NAME="${SOURCE_DB}-snapshot-${TIMESTAMP}"
+
+          # Length validation (AWS limit is 63 characters)
+          if [ ${#CLONE_NAME} -gt 63 ]; then
+            echo "ERROR: Clone name is too long (${#CLONE_NAME} chars, max 63): $CLONE_NAME"
+            exit 1
+          fi
+
+          if [ ${#INSTANCE_NAME} -gt 63 ]; then
+            echo "ERROR: Instance name is too long (${#INSTANCE_NAME} chars, max 63): $INSTANCE_NAME"
+            exit 1
+          fi
 
           echo "clone_name=$CLONE_NAME" >> $GITHUB_OUTPUT
           echo "instance_name=$INSTANCE_NAME" >> $GITHUB_OUTPUT

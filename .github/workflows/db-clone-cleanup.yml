@@ -2,6 +2,7 @@
 # DB Clone - TTL Cleanup (Scheduled)
 # =============================================================
 # Runs on a schedule to find and destroy expired clones.
+# Scans both Aurora clusters and RDS instances.
 # Checks the Expiry tag against current time.
 # =============================================================
 
@@ -20,6 +21,7 @@ permissions:
 jobs:
   cleanup-expired:
     runs-on: ubuntu-latest
+    environment: db-approval
     strategy:
       matrix:
         region: [us-east-1, us-west-2, eu-west-1, ca-central-1]
@@ -41,13 +43,19 @@ jobs:
           echo "Scanning for expired clones in $REGION..."
           echo "   Current time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          # Find all clusters managed by db-clone-system
+          # -------------------------------------------
+          # SCAN AURORA CLUSTERS
+          # -------------------------------------------
+          echo ""
+          echo "=== Scanning Aurora Clusters ==="
+
           CLUSTERS=$(aws rds describe-db-clusters \
             --region "$REGION" \
             --query "DBClusters[?contains(DBClusterIdentifier, 'clone')].{Id:DBClusterIdentifier,Arn:DBClusterArn}" \
             --output json)
 
-          echo "$CLUSTERS" | jq -c '.[]' | while read -r CLUSTER_JSON; do
+          while read -r CLUSTER_JSON; do
+            [ -z "$CLUSTER_JSON" ] && continue
             CLUSTER_ID=$(echo "$CLUSTER_JSON" | jq -r '.Id')
             CLUSTER_ARN=$(echo "$CLUSTER_JSON" | jq -r '.Arn')
 
@@ -84,7 +92,6 @@ jobs:
               continue
             fi
 
-            # Compare times
             EXPIRY_EPOCH=$(date -u -d "$EXPIRY_TAG" +%s 2>/dev/null)
             if [ -z "$EXPIRY_EPOCH" ]; then
               echo "   WARNING: $CLUSTER_ID: Invalid Expiry format: $EXPIRY_TAG"
@@ -92,10 +99,9 @@ jobs:
             fi
 
             if [ "$CURRENT_TIME" -gt "$EXPIRY_EPOCH" ]; then
-              echo "   EXPIRED: $CLUSTER_ID (expired at $EXPIRY_TAG)"
+              echo "   EXPIRED [cluster]: $CLUSTER_ID (expired at $EXPIRY_TAG)"
               echo "   Destroying..."
 
-              # Delete instances first
               INSTANCES=$(aws rds describe-db-instances \
                 --region "$REGION" \
                 --filters "Name=db-cluster-id,Values=$CLUSTER_ID" \
@@ -110,14 +116,12 @@ jobs:
                   --skip-final-snapshot || true
               done
 
-              # Wait for instances
               for INSTANCE in $INSTANCES; do
                 aws rds wait db-instance-deleted \
                   --region "$REGION" \
                   --db-instance-identifier "$INSTANCE" 2>/dev/null || true
               done
 
-              # Delete cluster
               echo "      Deleting cluster: $CLUSTER_ID"
               aws rds delete-db-cluster \
                 --region "$REGION" \
@@ -128,12 +132,115 @@ jobs:
               DELETED_COUNT=$((DELETED_COUNT + 1))
             else
               REMAINING=$(( (EXPIRY_EPOCH - CURRENT_TIME) / 3600 ))
-              echo "   ACTIVE: $CLUSTER_ID (${REMAINING}h remaining)"
+              echo "   ACTIVE [cluster]: $CLUSTER_ID (${REMAINING}h remaining)"
             fi
-          done
+          done < <(echo "$CLUSTERS" | jq -c '.[]')
+
+          # -------------------------------------------
+          # SCAN RDS INSTANCES
+          # -------------------------------------------
+          echo ""
+          echo "=== Scanning RDS Instances ==="
+
+          RDS_INSTANCES=$(aws rds describe-db-instances \
+            --region "$REGION" \
+            --query "DBInstances[?contains(DBInstanceIdentifier, 'clone')].{Id:DBInstanceIdentifier,Arn:DBInstanceArn}" \
+            --output json)
+
+          while read -r INSTANCE_JSON; do
+            [ -z "$INSTANCE_JSON" ] && continue
+            INSTANCE_ID=$(echo "$INSTANCE_JSON" | jq -r '.Id')
+            INSTANCE_ARN=$(echo "$INSTANCE_JSON" | jq -r '.Arn')
+
+            # Skip instances that belong to a cluster (handled above)
+            CLUSTER_ID=$(aws rds describe-db-instances \
+              --region "$REGION" \
+              --db-instance-identifier "$INSTANCE_ID" \
+              --query 'DBInstances[0].DBClusterIdentifier' \
+              --output text 2>/dev/null)
+
+            if [ -n "$CLUSTER_ID" ] && [ "$CLUSTER_ID" != "None" ]; then
+              continue
+            fi
+
+            # Check if managed by our system
+            PLATFORM_TAG=$(aws rds list-tags-for-resource \
+              --region "$REGION" \
+              --resource-name "$INSTANCE_ARN" \
+              --query "TagList[?Key=='Platform'].Value" \
+              --output text)
+
+            if [ "$PLATFORM_TAG" != "developer-tools" ]; then
+              continue
+            fi
+
+            MANAGED_BY=$(aws rds list-tags-for-resource \
+              --region "$REGION" \
+              --resource-name "$INSTANCE_ARN" \
+              --query "TagList[?Key=='ManagedBy'].Value" \
+              --output text)
+
+            if [ "$MANAGED_BY" != "db-clone-system" ]; then
+              continue
+            fi
+
+            # Get expiry
+            EXPIRY_TAG=$(aws rds list-tags-for-resource \
+              --region "$REGION" \
+              --resource-name "$INSTANCE_ARN" \
+              --query "TagList[?Key=='Expiry'].Value" \
+              --output text)
+
+            if [ -z "$EXPIRY_TAG" ] || [ "$EXPIRY_TAG" = "None" ]; then
+              echo "   WARNING: $INSTANCE_ID: No Expiry tag, skipping"
+              continue
+            fi
+
+            EXPIRY_EPOCH=$(date -u -d "$EXPIRY_TAG" +%s 2>/dev/null)
+            if [ -z "$EXPIRY_EPOCH" ]; then
+              echo "   WARNING: $INSTANCE_ID: Invalid Expiry format: $EXPIRY_TAG"
+              continue
+            fi
+
+            if [ "$CURRENT_TIME" -gt "$EXPIRY_EPOCH" ]; then
+              echo "   EXPIRED [instance]: $INSTANCE_ID (expired at $EXPIRY_TAG)"
+              echo "   Destroying..."
+
+              # Check for snapshot to cleanup
+              SNAPSHOT_ID=$(aws rds list-tags-for-resource \
+                --region "$REGION" \
+                --resource-name "$INSTANCE_ARN" \
+                --query "TagList[?Key=='SnapshotId'].Value" \
+                --output text 2>/dev/null)
+
+              echo "      Deleting instance: $INSTANCE_ID"
+              aws rds delete-db-instance \
+                --region "$REGION" \
+                --db-instance-identifier "$INSTANCE_ID" \
+                --skip-final-snapshot || true
+
+              aws rds wait db-instance-deleted \
+                --region "$REGION" \
+                --db-instance-identifier "$INSTANCE_ID" 2>/dev/null || true
+
+              # Cleanup snapshot if exists
+              if [ -n "$SNAPSHOT_ID" ] && [ "$SNAPSHOT_ID" != "None" ]; then
+                echo "      Deleting snapshot: $SNAPSHOT_ID"
+                aws rds delete-db-snapshot \
+                  --region "$REGION" \
+                  --db-snapshot-identifier "$SNAPSHOT_ID" || true
+              fi
+
+              echo "   Destroyed: $INSTANCE_ID"
+              DELETED_COUNT=$((DELETED_COUNT + 1))
+            else
+              REMAINING=$(( (EXPIRY_EPOCH - CURRENT_TIME) / 3600 ))
+              echo "   ACTIVE [instance]: $INSTANCE_ID (${REMAINING}h remaining)"
+            fi
+          done < <(echo "$RDS_INSTANCES" | jq -c '.[]')
 
           echo ""
-          echo "Cleanup scan complete for $REGION"
+          echo "Cleanup scan complete for $REGION. Deleted: $DELETED_COUNT"
           echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
 
       - name: Notify Slack on Cleanup

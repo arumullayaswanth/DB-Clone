@@ -36,6 +36,7 @@ permissions:
 jobs:
   destroy-clone:
     runs-on: ubuntu-latest
+    environment: db-approval
 
     steps:
       - name: Safety Checks

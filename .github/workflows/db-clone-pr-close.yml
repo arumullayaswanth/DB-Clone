@@ -2,7 +2,7 @@
 # DB Clone - PR Close (Auto Destroy)
 # =============================================================
 # Automatically destroys the clone when the PR is closed/merged.
-# Uses region matrix to scan for clones by PR tag.
+# Scans both Aurora clusters and RDS instances by PR tag.
 # Does NOT depend on config.yaml (branch may be deleted).
 # =============================================================
 
@@ -22,6 +22,7 @@ permissions:
 jobs:
   auto-destroy:
     runs-on: ubuntu-latest
+    environment: db-approval
     strategy:
       matrix:
         region: [us-east-1, ca-central-1]
@@ -33,47 +34,43 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ matrix.region }}
 
-      - name: Find Clone by PR Tag
+      - name: Find and Destroy Clone by PR Tag
         id: find_clone
         run: |
           REGION="${{ matrix.region }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
+          FOUND="false"
+          CLONE_NAME=""
 
           echo "Searching for clones tagged with PR=$PR_NUMBER in $REGION..."
 
+          # -------------------------------------------
+          # Search Aurora Clusters
+          # -------------------------------------------
           CLUSTERS=$(aws rds describe-db-clusters \
             --region "$REGION" \
             --query "DBClusters[?contains(DBClusterIdentifier, 'clone')].{Id:DBClusterIdentifier,Arn:DBClusterArn}" \
             --output json)
 
-          CLONE_FOUND=""
-          echo "$CLUSTERS" | jq -c '.[]' | while read -r CLUSTER_JSON; do
+          while read -r CLUSTER_JSON; do
+            [ -z "$CLUSTER_JSON" ] && continue
             CLUSTER_ID=$(echo "$CLUSTER_JSON" | jq -r '.Id')
             CLUSTER_ARN=$(echo "$CLUSTER_JSON" | jq -r '.Arn')
 
-            # Validate Platform tag
             PLATFORM_TAG=$(aws rds list-tags-for-resource \
               --region "$REGION" \
               --resource-name "$CLUSTER_ARN" \
               --query "TagList[?Key=='Platform'].Value" \
               --output text)
+            [ "$PLATFORM_TAG" != "developer-tools" ] && continue
 
-            if [ "$PLATFORM_TAG" != "developer-tools" ]; then
-              continue
-            fi
-
-            # Validate ManagedBy tag
             MANAGED_BY=$(aws rds list-tags-for-resource \
               --region "$REGION" \
               --resource-name "$CLUSTER_ARN" \
               --query "TagList[?Key=='ManagedBy'].Value" \
               --output text)
+            [ "$MANAGED_BY" != "db-clone-system" ] && continue
 
-            if [ "$MANAGED_BY" != "db-clone-system" ]; then
-              continue
-            fi
-
-            # Check PR tag
             PR_TAG=$(aws rds list-tags-for-resource \
               --region "$REGION" \
               --resource-name "$CLUSTER_ARN" \
@@ -81,70 +78,131 @@ jobs:
               --output text)
 
             if [ "$PR_TAG" = "$PR_NUMBER" ]; then
-              echo "$CLUSTER_ID" > /tmp/clone_found.txt
+              echo "Found Aurora cluster clone: $CLUSTER_ID"
+
+              # Delete instances
+              INSTANCES=$(aws rds describe-db-instances \
+                --region "$REGION" \
+                --filters "Name=db-cluster-id,Values=$CLUSTER_ID" \
+                --query 'DBInstances[].DBInstanceIdentifier' \
+                --output text)
+
+              for INSTANCE in $INSTANCES; do
+                echo "   Deleting instance: $INSTANCE"
+                aws rds delete-db-instance \
+                  --region "$REGION" \
+                  --db-instance-identifier "$INSTANCE" \
+                  --skip-final-snapshot || true
+              done
+
+              for INSTANCE in $INSTANCES; do
+                aws rds wait db-instance-deleted \
+                  --region "$REGION" \
+                  --db-instance-identifier "$INSTANCE" 2>/dev/null || true
+              done
+
+              # Delete cluster
+              echo "   Deleting cluster: $CLUSTER_ID"
+              aws rds delete-db-cluster \
+                --region "$REGION" \
+                --db-cluster-identifier "$CLUSTER_ID" \
+                --skip-final-snapshot || true
+
+              aws rds wait db-cluster-deleted \
+                --region "$REGION" \
+                --db-cluster-identifier "$CLUSTER_ID" 2>/dev/null || true
+
+              FOUND="true"
+              CLONE_NAME="$CLUSTER_ID"
               break
             fi
-          done
+          done < <(echo "$CLUSTERS" | jq -c '.[]')
 
-          if [ -f /tmp/clone_found.txt ]; then
-            CLONE_FOUND=$(cat /tmp/clone_found.txt)
-            echo "Found clone: $CLONE_FOUND"
-            echo "clone_name=$CLONE_FOUND" >> $GITHUB_OUTPUT
+          # -------------------------------------------
+          # Search RDS Instances (if not found in clusters)
+          # -------------------------------------------
+          if [ "$FOUND" = "false" ]; then
+            RDS_INSTANCES=$(aws rds describe-db-instances \
+              --region "$REGION" \
+              --query "DBInstances[?contains(DBInstanceIdentifier, 'clone')].{Id:DBInstanceIdentifier,Arn:DBInstanceArn}" \
+              --output json)
+
+            while read -r INSTANCE_JSON; do
+              [ -z "$INSTANCE_JSON" ] && continue
+              INSTANCE_ID=$(echo "$INSTANCE_JSON" | jq -r '.Id')
+              INSTANCE_ARN=$(echo "$INSTANCE_JSON" | jq -r '.Arn')
+
+              # Skip cluster members
+              CLUSTER_MEMBER=$(aws rds describe-db-instances \
+                --region "$REGION" \
+                --db-instance-identifier "$INSTANCE_ID" \
+                --query 'DBInstances[0].DBClusterIdentifier' \
+                --output text 2>/dev/null)
+              [ -n "$CLUSTER_MEMBER" ] && [ "$CLUSTER_MEMBER" != "None" ] && continue
+
+              PLATFORM_TAG=$(aws rds list-tags-for-resource \
+                --region "$REGION" \
+                --resource-name "$INSTANCE_ARN" \
+                --query "TagList[?Key=='Platform'].Value" \
+                --output text)
+              [ "$PLATFORM_TAG" != "developer-tools" ] && continue
+
+              MANAGED_BY=$(aws rds list-tags-for-resource \
+                --region "$REGION" \
+                --resource-name "$INSTANCE_ARN" \
+                --query "TagList[?Key=='ManagedBy'].Value" \
+                --output text)
+              [ "$MANAGED_BY" != "db-clone-system" ] && continue
+
+              PR_TAG=$(aws rds list-tags-for-resource \
+                --region "$REGION" \
+                --resource-name "$INSTANCE_ARN" \
+                --query "TagList[?Key=='PR'].Value" \
+                --output text)
+
+              if [ "$PR_TAG" = "$PR_NUMBER" ]; then
+                echo "Found RDS instance clone: $INSTANCE_ID"
+
+                # Get snapshot ID for cleanup
+                SNAPSHOT_ID=$(aws rds list-tags-for-resource \
+                  --region "$REGION" \
+                  --resource-name "$INSTANCE_ARN" \
+                  --query "TagList[?Key=='SnapshotId'].Value" \
+                  --output text 2>/dev/null)
+
+                # Delete instance
+                echo "   Deleting instance: $INSTANCE_ID"
+                aws rds delete-db-instance \
+                  --region "$REGION" \
+                  --db-instance-identifier "$INSTANCE_ID" \
+                  --skip-final-snapshot || true
+
+                aws rds wait db-instance-deleted \
+                  --region "$REGION" \
+                  --db-instance-identifier "$INSTANCE_ID" 2>/dev/null || true
+
+                # Cleanup snapshot
+                if [ -n "$SNAPSHOT_ID" ] && [ "$SNAPSHOT_ID" != "None" ]; then
+                  echo "   Deleting snapshot: $SNAPSHOT_ID"
+                  aws rds delete-db-snapshot \
+                    --region "$REGION" \
+                    --db-snapshot-identifier "$SNAPSHOT_ID" || true
+                fi
+
+                FOUND="true"
+                CLONE_NAME="$INSTANCE_ID"
+                break
+              fi
+            done < <(echo "$RDS_INSTANCES" | jq -c '.[]')
+          fi
+
+          if [ "$FOUND" = "true" ]; then
+            echo "clone_name=$CLONE_NAME" >> $GITHUB_OUTPUT
             echo "found=true" >> $GITHUB_OUTPUT
           else
             echo "No clone found for PR #$PR_NUMBER in $REGION."
             echo "found=false" >> $GITHUB_OUTPUT
           fi
-
-      - name: Delete DB Instances
-        if: steps.find_clone.outputs.found == 'true'
-        run: |
-          CLUSTER="${{ steps.find_clone.outputs.clone_name }}"
-          REGION="${{ matrix.region }}"
-
-          echo "Deleting instances for cluster: $CLUSTER"
-
-          INSTANCES=$(aws rds describe-db-instances \
-            --region "$REGION" \
-            --filters "Name=db-cluster-id,Values=$CLUSTER" \
-            --query 'DBInstances[].DBInstanceIdentifier' \
-            --output text)
-
-          for INSTANCE in $INSTANCES; do
-            echo "   Deleting: $INSTANCE"
-            aws rds delete-db-instance \
-              --region "$REGION" \
-              --db-instance-identifier "$INSTANCE" \
-              --skip-final-snapshot
-          done
-
-          for INSTANCE in $INSTANCES; do
-            echo "   Waiting: $INSTANCE"
-            aws rds wait db-instance-deleted \
-              --region "$REGION" \
-              --db-instance-identifier "$INSTANCE" || true
-          done
-
-          echo "Instances deleted"
-
-      - name: Delete DB Cluster
-        if: steps.find_clone.outputs.found == 'true'
-        run: |
-          CLUSTER="${{ steps.find_clone.outputs.clone_name }}"
-          REGION="${{ matrix.region }}"
-
-          echo "Deleting cluster: $CLUSTER"
-
-          aws rds delete-db-cluster \
-            --region "$REGION" \
-            --db-cluster-identifier "$CLUSTER" \
-            --skip-final-snapshot
-
-          aws rds wait db-cluster-deleted \
-            --region "$REGION" \
-            --db-cluster-identifier "$CLUSTER" || true
-
-          echo "Cluster deleted"
 
       - name: Comment on PR
         if: steps.find_clone.outputs.found == 'true'
@@ -157,7 +215,7 @@ jobs:
 
             | Property | Value |
             |----------|-------|
-            | **Cluster** | \`${cloneName}\` |
+            | **Clone** | \`${cloneName}\` |
             | **Region** | \`${region}\` |
             | **Reason** | PR closed |
             | **Destroyed at** | ${new Date().toISOString()} |
