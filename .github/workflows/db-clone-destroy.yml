@@ -2,6 +2,7 @@
 # DB Clone - Destroy (Manual)
 # =============================================================
 # Manually triggered to destroy a specific clone.
+# Supports both Aurora clusters and RDS instances.
 # Includes safety checks to prevent accidental deletion.
 # =============================================================
 
@@ -10,15 +11,23 @@ name: "DB Clone - Destroy"
 on:
   workflow_dispatch:
     inputs:
-      cluster_name:
-        description: "Clone cluster name (must contain '-clone-')"
+      clone_name:
+        description: "Clone name (must contain '-clone-')"
         required: true
         type: string
       region:
         description: "AWS Region"
         required: true
-        default: "us-east-1"
+        default: "ca-central-1"
         type: string
+      source_type:
+        description: "Source type (aurora-cluster or rds-instance)"
+        required: true
+        default: "aurora-cluster"
+        type: choice
+        options:
+          - aurora-cluster
+          - rds-instance
 
 permissions:
   contents: read
@@ -31,20 +40,19 @@ jobs:
     steps:
       - name: Safety Checks
         run: |
-          CLUSTER="${{ inputs.cluster_name }}"
-          REGION="${{ inputs.region }}"
+          CLONE="${{ inputs.clone_name }}"
 
           echo "Running safety checks..."
 
           # Must contain -clone-
-          if [[ "$CLUSTER" != *"-clone-"* ]]; then
-            echo "SAFETY ERROR: Cluster name must contain '-clone-'"
-            echo "   Got: $CLUSTER"
+          if [[ "$CLONE" != *"-clone-"* ]]; then
+            echo "SAFETY ERROR: Name must contain '-clone-'"
+            echo "   Got: $CLONE"
             echo "   This prevents accidental deletion of production databases."
             exit 1
           fi
 
-          echo "Cluster name contains '-clone-'"
+          echo "Name contains '-clone-'"
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -53,107 +61,161 @@ jobs:
           aws-region: ${{ inputs.region }}
 
       - name: Validate Tags
+        id: validate
         run: |
-          CLUSTER="${{ inputs.cluster_name }}"
+          CLONE="${{ inputs.clone_name }}"
           REGION="${{ inputs.region }}"
+          SOURCE_TYPE="${{ inputs.source_type }}"
 
           echo "Validating tags..."
 
-          # Get cluster ARN
-          CLUSTER_ARN=$(aws rds describe-db-clusters \
-            --region "$REGION" \
-            --db-cluster-identifier "$CLUSTER" \
-            --query 'DBClusters[0].DBClusterArn' \
-            --output text 2>/dev/null)
+          # Get ARN based on source type
+          if [ "$SOURCE_TYPE" = "aurora-cluster" ]; then
+            RESOURCE_ARN=$(aws rds describe-db-clusters \
+              --region "$REGION" \
+              --db-cluster-identifier "$CLONE" \
+              --query 'DBClusters[0].DBClusterArn' \
+              --output text 2>/dev/null)
+          else
+            RESOURCE_ARN=$(aws rds describe-db-instances \
+              --region "$REGION" \
+              --db-instance-identifier "$CLONE" \
+              --query 'DBInstances[0].DBInstanceArn' \
+              --output text 2>/dev/null)
+          fi
 
-          if [ -z "$CLUSTER_ARN" ] || [ "$CLUSTER_ARN" = "None" ]; then
-            echo "ERROR: Cluster not found: $CLUSTER"
+          if [ -z "$RESOURCE_ARN" ] || [ "$RESOURCE_ARN" = "None" ]; then
+            echo "ERROR: Clone not found: $CLONE (type: $SOURCE_TYPE)"
             exit 1
           fi
 
           # Check Platform tag
           PLATFORM_TAG=$(aws rds list-tags-for-resource \
             --region "$REGION" \
-            --resource-name "$CLUSTER_ARN" \
+            --resource-name "$RESOURCE_ARN" \
             --query "TagList[?Key=='Platform'].Value" \
             --output text)
 
           if [ "$PLATFORM_TAG" != "developer-tools" ]; then
-            echo "SAFETY ERROR: Cluster missing Platform=developer-tools tag"
-            echo "   This is not a managed clone. Aborting."
+            echo "SAFETY ERROR: Missing Platform=developer-tools tag. Aborting."
+            exit 1
+          fi
+
+          # Check ManagedBy tag
+          MANAGED_BY=$(aws rds list-tags-for-resource \
+            --region "$REGION" \
+            --resource-name "$RESOURCE_ARN" \
+            --query "TagList[?Key=='ManagedBy'].Value" \
+            --output text)
+
+          if [ "$MANAGED_BY" != "db-clone-system" ]; then
+            echo "SAFETY ERROR: Missing ManagedBy=db-clone-system tag. Aborting."
             exit 1
           fi
 
           # Check Expiry tag exists
           EXPIRY_TAG=$(aws rds list-tags-for-resource \
             --region "$REGION" \
-            --resource-name "$CLUSTER_ARN" \
+            --resource-name "$RESOURCE_ARN" \
             --query "TagList[?Key=='Expiry'].Value" \
             --output text)
 
           if [ -z "$EXPIRY_TAG" ] || [ "$EXPIRY_TAG" = "None" ]; then
-            echo "SAFETY ERROR: Cluster missing Expiry tag"
-            echo "   This is not a managed clone. Aborting."
+            echo "SAFETY ERROR: Missing Expiry tag. Aborting."
             exit 1
           fi
 
+          # Check for snapshot to clean up (rds-instance)
+          SNAPSHOT_ID=$(aws rds list-tags-for-resource \
+            --region "$REGION" \
+            --resource-name "$RESOURCE_ARN" \
+            --query "TagList[?Key=='SnapshotId'].Value" \
+            --output text 2>/dev/null || echo "")
+
+          echo "snapshot_id=$SNAPSHOT_ID" >> $GITHUB_OUTPUT
+
           echo "All tag validations passed"
           echo "   Platform: $PLATFORM_TAG"
+          echo "   ManagedBy: $MANAGED_BY"
           echo "   Expiry: $EXPIRY_TAG"
 
-      - name: Delete DB Instances
+      - name: Destroy Aurora Cluster Clone
+        if: inputs.source_type == 'aurora-cluster'
         run: |
-          CLUSTER="${{ inputs.cluster_name }}"
+          CLONE="${{ inputs.clone_name }}"
           REGION="${{ inputs.region }}"
 
-          echo "Finding and deleting instances..."
-
+          # Delete instances first
           INSTANCES=$(aws rds describe-db-instances \
             --region "$REGION" \
-            --filters "Name=db-cluster-id,Values=$CLUSTER" \
+            --filters "Name=db-cluster-id,Values=$CLONE" \
             --query 'DBInstances[].DBInstanceIdentifier' \
             --output text)
 
           for INSTANCE in $INSTANCES; do
-            echo "   Deleting instance: $INSTANCE"
+            echo "Deleting instance: $INSTANCE"
             aws rds delete-db-instance \
               --region "$REGION" \
               --db-instance-identifier "$INSTANCE" \
               --skip-final-snapshot
           done
 
-          # Wait for instances to be deleted
           for INSTANCE in $INSTANCES; do
-            echo "   Waiting for instance deletion: $INSTANCE"
+            echo "Waiting for instance deletion: $INSTANCE"
             aws rds wait db-instance-deleted \
               --region "$REGION" \
               --db-instance-identifier "$INSTANCE" || true
           done
 
-          echo "All instances deleted"
-
-      - name: Delete DB Cluster
-        run: |
-          CLUSTER="${{ inputs.cluster_name }}"
-          REGION="${{ inputs.region }}"
-
-          echo "Deleting cluster: $CLUSTER"
-
+          # Delete cluster
+          echo "Deleting cluster: $CLONE"
           aws rds delete-db-cluster \
             --region "$REGION" \
-            --db-cluster-identifier "$CLUSTER" \
+            --db-cluster-identifier "$CLONE" \
             --skip-final-snapshot
 
-          echo "Waiting for cluster deletion..."
           aws rds wait db-cluster-deleted \
             --region "$REGION" \
-            --db-cluster-identifier "$CLUSTER" || true
+            --db-cluster-identifier "$CLONE" || true
 
-          echo "Cluster deleted: $CLUSTER"
+          echo "Cluster deleted: $CLONE"
+
+      - name: Destroy RDS Instance Clone
+        if: inputs.source_type == 'rds-instance'
+        run: |
+          CLONE="${{ inputs.clone_name }}"
+          REGION="${{ inputs.region }}"
+
+          echo "Deleting RDS instance: $CLONE"
+          aws rds delete-db-instance \
+            --region "$REGION" \
+            --db-instance-identifier "$CLONE" \
+            --skip-final-snapshot
+
+          aws rds wait db-instance-deleted \
+            --region "$REGION" \
+            --db-instance-identifier "$CLONE" || true
+
+          echo "Instance deleted: $CLONE"
+
+      - name: Cleanup Snapshot
+        if: inputs.source_type == 'rds-instance' && steps.validate.outputs.snapshot_id != ''
+        run: |
+          SNAPSHOT_ID="${{ steps.validate.outputs.snapshot_id }}"
+          REGION="${{ inputs.region }}"
+
+          if [ -n "$SNAPSHOT_ID" ] && [ "$SNAPSHOT_ID" != "None" ]; then
+            echo "Cleaning up snapshot: $SNAPSHOT_ID"
+            aws rds delete-db-snapshot \
+              --region "$REGION" \
+              --db-snapshot-identifier "$SNAPSHOT_ID" || true
+            echo "Snapshot deleted"
+          fi
 
       - name: Summary
         run: |
           echo "DB Clone destroyed successfully"
-          echo "   Cluster: ${{ inputs.cluster_name }}"
+          echo "   Clone: ${{ inputs.clone_name }}"
+          echo "   Type: ${{ inputs.source_type }}"
           echo "   Region: ${{ inputs.region }}"
           echo "   Destroyed by: ${{ github.actor }}"

@@ -4,7 +4,19 @@
 # Developers: Edit this file and open a PR to request a clone.
 # A reviewer (SRE/Approver) must approve before the clone is created.
 # =============================================================
+#
+# source_type options:
+#   aurora-cluster  - Aurora MySQL / Aurora PostgreSQL (copy-on-write clone)
+#   rds-instance    - Standard RDS MySQL / PostgreSQL (snapshot + restore)
+#
+# instance_class examples:
+#   db.r5.large    - Production-like performance testing
+#   db.t3.medium   - General sandbox testing
+#   db.t3.micro    - Lightweight debugging
+# =============================================================
 
-region: us-east-1
+region: ca-central-1
 source_db: cm-mysql-cluster-prd-us-emailtrack
+source_type: aurora-cluster
 ttl_hours: 24
+instance_class: db.t3.medium

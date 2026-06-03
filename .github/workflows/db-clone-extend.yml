@@ -82,6 +82,75 @@ jobs:
 
           echo "Cluster found. Status: $STATUS"
 
+      - name: Validate Tags
+        run: |
+          CLUSTER="${{ inputs.cluster_name }}"
+          REGION="${{ inputs.region }}"
+
+          # Get cluster ARN
+          CLUSTER_ARN=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLUSTER" \
+            --query 'DBClusters[0].DBClusterArn' \
+            --output text)
+
+          # Check Platform tag
+          PLATFORM_TAG=$(aws rds list-tags-for-resource \
+            --region "$REGION" \
+            --resource-name "$CLUSTER_ARN" \
+            --query "TagList[?Key=='Platform'].Value" \
+            --output text)
+
+          if [ "$PLATFORM_TAG" != "developer-tools" ]; then
+            echo "ERROR: Cluster missing Platform=developer-tools tag"
+            echo "   This is not a managed clone. Cannot extend."
+            exit 1
+          fi
+
+          # Check ManagedBy tag
+          MANAGED_BY=$(aws rds list-tags-for-resource \
+            --region "$REGION" \
+            --resource-name "$CLUSTER_ARN" \
+            --query "TagList[?Key=='ManagedBy'].Value" \
+            --output text)
+
+          if [ "$MANAGED_BY" != "db-clone-system" ]; then
+            echo "ERROR: Cluster missing ManagedBy=db-clone-system tag"
+            echo "   This is not a managed clone. Cannot extend."
+            exit 1
+          fi
+
+          # Check Expiry tag exists
+          EXPIRY_TAG=$(aws rds list-tags-for-resource \
+            --region "$REGION" \
+            --resource-name "$CLUSTER_ARN" \
+            --query "TagList[?Key=='Expiry'].Value" \
+            --output text)
+
+          if [ -z "$EXPIRY_TAG" ] || [ "$EXPIRY_TAG" = "None" ]; then
+            echo "ERROR: Cluster missing Expiry tag"
+            echo "   This is not a managed clone. Cannot extend."
+            exit 1
+          fi
+
+          # Check Requester matches current user (optional but recommended)
+          REQUESTER_TAG=$(aws rds list-tags-for-resource \
+            --region "$REGION" \
+            --resource-name "$CLUSTER_ARN" \
+            --query "TagList[?Key=='Requester'].Value" \
+            --output text)
+
+          if [ "$REQUESTER_TAG" != "${{ github.actor }}" ]; then
+            echo "WARNING: You (${{ github.actor }}) are not the original requester ($REQUESTER_TAG)"
+            echo "   Proceeding anyway, but only the requester should normally extend."
+          fi
+
+          echo "All tag validations passed"
+          echo "   Platform: $PLATFORM_TAG"
+          echo "   ManagedBy: $MANAGED_BY"
+          echo "   Expiry: $EXPIRY_TAG"
+          echo "   Requester: $REQUESTER_TAG"
+
       - name: Update Expiry Tag
         run: |
           CLUSTER="${{ inputs.cluster_name }}"

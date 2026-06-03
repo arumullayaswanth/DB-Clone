@@ -2,7 +2,8 @@
 # DB Clone - PR Close (Auto Destroy)
 # =============================================================
 # Automatically destroys the clone when the PR is closed/merged.
-# Keeps the environment clean without manual intervention.
+# Uses region matrix to scan for clones by PR tag.
+# Does NOT depend on config.yaml (branch may be deleted).
 # =============================================================
 
 name: "DB Clone - PR Close"
@@ -21,46 +22,58 @@ permissions:
 jobs:
   auto-destroy:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        region: [us-east-1, ca-central-1]
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Parse Config
-        id: config
-        run: |
-          CONFIG_FILE="db-clone/config.yaml"
-          REGION=$(grep '^region:' "$CONFIG_FILE" | awk '{print $2}')
-          echo "region=$REGION" >> $GITHUB_OUTPUT
-
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ steps.config.outputs.region }}
+          aws-region: ${{ matrix.region }}
 
       - name: Find Clone by PR Tag
         id: find_clone
         run: |
-          REGION="${{ steps.config.outputs.region }}"
+          REGION="${{ matrix.region }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          echo "Searching for clones tagged with PR=$PR_NUMBER..."
+          echo "Searching for clones tagged with PR=$PR_NUMBER in $REGION..."
 
-          # Find clusters with matching PR tag
           CLUSTERS=$(aws rds describe-db-clusters \
             --region "$REGION" \
-            --query "DBClusters[?contains(DBClusterIdentifier, 'clone')].DBClusterIdentifier" \
-            --output text)
+            --query "DBClusters[?contains(DBClusterIdentifier, 'clone')].{Id:DBClusterIdentifier,Arn:DBClusterArn}" \
+            --output json)
 
           CLONE_FOUND=""
-          for CLUSTER in $CLUSTERS; do
-            CLUSTER_ARN=$(aws rds describe-db-clusters \
+          echo "$CLUSTERS" | jq -c '.[]' | while read -r CLUSTER_JSON; do
+            CLUSTER_ID=$(echo "$CLUSTER_JSON" | jq -r '.Id')
+            CLUSTER_ARN=$(echo "$CLUSTER_JSON" | jq -r '.Arn')
+
+            # Validate Platform tag
+            PLATFORM_TAG=$(aws rds list-tags-for-resource \
               --region "$REGION" \
-              --db-cluster-identifier "$CLUSTER" \
-              --query 'DBClusters[0].DBClusterArn' \
+              --resource-name "$CLUSTER_ARN" \
+              --query "TagList[?Key=='Platform'].Value" \
               --output text)
 
+            if [ "$PLATFORM_TAG" != "developer-tools" ]; then
+              continue
+            fi
+
+            # Validate ManagedBy tag
+            MANAGED_BY=$(aws rds list-tags-for-resource \
+              --region "$REGION" \
+              --resource-name "$CLUSTER_ARN" \
+              --query "TagList[?Key=='ManagedBy'].Value" \
+              --output text)
+
+            if [ "$MANAGED_BY" != "db-clone-system" ]; then
+              continue
+            fi
+
+            # Check PR tag
             PR_TAG=$(aws rds list-tags-for-resource \
               --region "$REGION" \
               --resource-name "$CLUSTER_ARN" \
@@ -68,25 +81,26 @@ jobs:
               --output text)
 
             if [ "$PR_TAG" = "$PR_NUMBER" ]; then
-              CLONE_FOUND="$CLUSTER"
-              echo "Found clone: $CLUSTER"
+              echo "$CLUSTER_ID" > /tmp/clone_found.txt
               break
             fi
           done
 
-          if [ -z "$CLONE_FOUND" ]; then
-            echo "No clone found for PR #$PR_NUMBER. May have been already destroyed."
-            echo "found=false" >> $GITHUB_OUTPUT
-          else
+          if [ -f /tmp/clone_found.txt ]; then
+            CLONE_FOUND=$(cat /tmp/clone_found.txt)
+            echo "Found clone: $CLONE_FOUND"
             echo "clone_name=$CLONE_FOUND" >> $GITHUB_OUTPUT
             echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "No clone found for PR #$PR_NUMBER in $REGION."
+            echo "found=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Delete DB Instances
         if: steps.find_clone.outputs.found == 'true'
         run: |
           CLUSTER="${{ steps.find_clone.outputs.clone_name }}"
-          REGION="${{ steps.config.outputs.region }}"
+          REGION="${{ matrix.region }}"
 
           echo "Deleting instances for cluster: $CLUSTER"
 
@@ -117,7 +131,7 @@ jobs:
         if: steps.find_clone.outputs.found == 'true'
         run: |
           CLUSTER="${{ steps.find_clone.outputs.clone_name }}"
-          REGION="${{ steps.config.outputs.region }}"
+          REGION="${{ matrix.region }}"
 
           echo "Deleting cluster: $CLUSTER"
 
@@ -138,11 +152,13 @@ jobs:
         with:
           script: |
             const cloneName = '${{ steps.find_clone.outputs.clone_name }}';
+            const region = '${{ matrix.region }}';
             const body = `## DB Clone Destroyed
 
             | Property | Value |
             |----------|-------|
             | **Cluster** | \`${cloneName}\` |
+            | **Region** | \`${region}\` |
             | **Reason** | PR closed |
             | **Destroyed at** | ${new Date().toISOString()} |
 

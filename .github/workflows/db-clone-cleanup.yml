@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        region: [us-east-1, us-west-2, eu-west-1] # Add regions as needed
+        region: [us-east-1, us-west-2, eu-west-1, ca-central-1]
 
     steps:
       - name: Configure AWS Credentials
@@ -32,9 +32,11 @@ jobs:
           aws-region: ${{ matrix.region }}
 
       - name: Find and Destroy Expired Clones
+        id: cleanup
         run: |
           REGION="${{ matrix.region }}"
           CURRENT_TIME=$(date -u +%s)
+          DELETED_COUNT=0
 
           echo "Scanning for expired clones in $REGION..."
           echo "   Current time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -123,6 +125,7 @@ jobs:
                 --skip-final-snapshot || true
 
               echo "   Destroyed: $CLUSTER_ID"
+              DELETED_COUNT=$((DELETED_COUNT + 1))
             else
               REMAINING=$(( (EXPIRY_EPOCH - CURRENT_TIME) / 3600 ))
               echo "   ACTIVE: $CLUSTER_ID (${REMAINING}h remaining)"
@@ -131,8 +134,10 @@ jobs:
 
           echo ""
           echo "Cleanup scan complete for $REGION"
+          echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
 
       - name: Notify Slack on Cleanup
+        if: steps.cleanup.outputs.deleted_count != '0'
         run: |
           if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
             echo "Slack webhook not configured. Skipping notification."
@@ -142,5 +147,5 @@ jobs:
           curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
             -H 'Content-type: application/json' \
             -d '{
-              "text": "DB Clone TTL Cleanup completed for region: ${{ matrix.region }}"
+              "text": "DB Clone TTL Cleanup: Destroyed ${{ steps.cleanup.outputs.deleted_count }} expired clone(s) in region ${{ matrix.region }}"
             }' || true
