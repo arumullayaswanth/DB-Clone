@@ -128,7 +128,85 @@ jobs:
           aws-region: ${{ steps.config.outputs.region }}
 
       # -------------------------------------------
-      # 3.5 AWS - Create DB Cluster Clone
+      # 3.5a Validate Source DB Exists (NEW - Change 5)
+      # -------------------------------------------
+      - name: Validate Source DB Exists
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          SOURCE_DB="${{ steps.config.outputs.source_db }}"
+
+          echo "Checking source DB exists: $SOURCE_DB in $REGION"
+
+          EXISTS=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --db-cluster-identifier "$SOURCE_DB" \
+            --query "DBClusters[0].DBClusterIdentifier" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$EXISTS" = "NOT_FOUND" ] || [ "$EXISTS" = "None" ]; then
+            echo "ERROR: Source DB '$SOURCE_DB' does not exist in region '$REGION'"
+            exit 1
+          fi
+
+          echo "Source DB exists."
+
+      # -------------------------------------------
+      # 3.5b Validate Source DB Engine (NEW - Change 6)
+      # -------------------------------------------
+      - name: Validate Source DB Engine
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          SOURCE_DB="${{ steps.config.outputs.source_db }}"
+
+          ENGINE=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --db-cluster-identifier "$SOURCE_DB" \
+            --query "DBClusters[0].Engine" \
+            --output text)
+
+          if [ "$ENGINE" != "aurora-mysql" ]; then
+            echo "ERROR: Only aurora-mysql is supported. Found: $ENGINE"
+            exit 1
+          fi
+
+          echo "Engine validation passed: $ENGINE"
+
+      # -------------------------------------------
+      # 3.5c Prevent Duplicate Clone for PR (NEW - Change 7)
+      # -------------------------------------------
+      - name: Prevent Duplicate Clone for PR
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          echo "Checking for existing clone for PR #$PR_NUMBER"
+
+          CLUSTERS=$(aws rds describe-db-clusters \
+            --region "$REGION" \
+            --query "DBClusters[?contains(DBClusterIdentifier, 'clone')].{Id:DBClusterIdentifier,Arn:DBClusterArn}" \
+            --output json)
+
+          MATCH=$(echo "$CLUSTERS" | jq -r --arg PR "$PR_NUMBER" '.[] | .Arn + " " + .Id' | while read -r ARN ID; do
+            TAG_PR=$(aws rds list-tags-for-resource \
+              --region "$REGION" \
+              --resource-name "$ARN" \
+              --query "TagList[?Key=='PR'].Value" \
+              --output text)
+            if [ "$TAG_PR" = "$PR_NUMBER" ]; then
+              echo "$ID"
+              break
+            fi
+          done)
+
+          if [ -n "$MATCH" ]; then
+            echo "ERROR: A clone already exists for this PR: $MATCH"
+            exit 1
+          fi
+
+          echo "No existing clone found for this PR."
+
+      # -------------------------------------------
+      # 3.6 AWS - Create DB Cluster Clone
       # -------------------------------------------
       - name: Create DB Cluster Clone
         id: create_cluster
@@ -159,7 +237,7 @@ jobs:
           echo "Cluster clone initiated: $CLONE_NAME"
 
       # -------------------------------------------
-      # 3.6 Create DB Instance
+      # 3.7 Create DB Instance
       # -------------------------------------------
       - name: Create DB Instance
         run: |
@@ -187,7 +265,7 @@ jobs:
           echo "Instance creation initiated: $INSTANCE_NAME"
 
       # -------------------------------------------
-      # 3.7 Wait Until Ready
+      # 3.8 Wait Until Ready
       # -------------------------------------------
       - name: Wait for Cluster Available
         run: |
@@ -212,7 +290,7 @@ jobs:
           echo "Instance is available"
 
       # -------------------------------------------
-      # 3.8 Fetch Endpoint
+      # 3.9 Fetch Endpoint
       # -------------------------------------------
       - name: Fetch Endpoint
         id: endpoint
@@ -238,7 +316,7 @@ jobs:
           echo "Endpoint: $ENDPOINT:$PORT"
 
       # -------------------------------------------
-      # 3.9 Notify - PR Comment
+      # 3.10 Notify - PR Comment
       # -------------------------------------------
       - name: Comment on PR
         uses: actions/github-script@v7
@@ -283,12 +361,16 @@ jobs:
             });
 
       # -------------------------------------------
-      # 3.9 Notify - Slack
+      # 3.11 Notify - Slack (Change 4: uses secrets)
       # -------------------------------------------
       - name: Notify Slack
-        if: ${{ vars.SLACK_WEBHOOK_URL != '' }}
         run: |
-          curl -X POST "${{ vars.SLACK_WEBHOOK_URL }}" \
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "Slack webhook not configured. Skipping notification."
+            exit 0
+          fi
+
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
             -H 'Content-type: application/json' \
             -d '{
               "blocks": [

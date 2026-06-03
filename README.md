@@ -25,6 +25,11 @@ Approval Gate (SRE reviews)
         |
 Create workflow runs
         |
+  - Validates inputs
+  - Validates source DB exists
+  - Validates engine is aurora-mysql
+  - Checks no duplicate clone for PR
+        |
 AWS Clone created + tagged
         |
 Endpoint returned (PR comment + Slack)
@@ -37,6 +42,24 @@ Cleanup happens:
 +-- Manual destroy
 +-- PR closed (auto)
 +-- TTL expired (scheduled)
+```
+
+---
+
+## Repository Structure
+
+```
+DB-CLONE/
++-- .github/workflows/
+|   +-- db-clone-create.yml
+|   +-- db-clone-extend.yml
+|   +-- db-clone-destroy.yml
+|   +-- db-clone-pr-close.yml
+|   +-- db-clone-cleanup.yml
++-- db-clone/
+|   +-- config.yaml
++-- .gitignore
++-- README.md
 ```
 
 ---
@@ -62,8 +85,8 @@ ttl_hours: 24
 
 | Field | Description | Constraints |
 |-------|-------------|-------------|
-| `region` | AWS region | Valid AWS region format |
-| `source_db` | Source cluster identifier | Must exist in the region |
+| `region` | AWS region | Valid AWS region format (e.g., us-east-1) |
+| `source_db` | Source cluster identifier | Must exist in the region, must be aurora-mysql |
 | `ttl_hours` | Time-to-live in hours | 1-48 hours |
 
 ---
@@ -109,20 +132,21 @@ Every clone is tagged with:
 
 1. **Approval gate** - No clone without SRE sign-off
 2. **TTL enforcement** - Max 48 hours, auto-cleanup
-3. **Name validation** - Must contain `-clone-` for destroy
-4. **Tag validation** - Must have `Platform=developer-tools` and `Expiry`
-5. **Auto-cleanup on PR close** - No orphaned resources
-6. **Scheduled cleanup** - Catches anything missed
+3. **Source DB validation** - Fails early if source DB does not exist
+4. **Engine validation** - Only aurora-mysql is supported
+5. **Duplicate prevention** - Only one clone per PR allowed
+6. **Name validation** - Must contain `-clone-` for destroy
+7. **Tag validation** - Must have `Platform=developer-tools` and `Expiry`
+8. **Auto-cleanup on PR close** - No orphaned resources
+9. **Scheduled cleanup** - Catches anything missed
 
 ---
 
 ## Setup Requirements
 
 ### GitHub Secrets
-- `AWS_ROLE_ARN` - IAM role with RDS permissions
-
-### GitHub Variables
-- `SLACK_WEBHOOK_URL` (optional) - For Slack notifications
+- `AWS_ROLE_ARN` - IAM role ARN for OIDC (e.g., `arn:aws:iam::<account-id>:role/github-db-clone-role`)
+- `SLACK_WEBHOOK_URL` - Slack incoming webhook URL (optional, for notifications)
 
 ### GitHub Environment
 - `db-approval` - With required reviewers configured
@@ -130,18 +154,48 @@ Every clone is tagged with:
 ### AWS IAM Permissions Required
 ```json
 {
-  "Effect": "Allow",
-  "Action": [
-    "rds:RestoreDBClusterToPointInTime",
-    "rds:CreateDBInstance",
-    "rds:DeleteDBInstance",
-    "rds:DeleteDBCluster",
-    "rds:DescribeDBClusters",
-    "rds:DescribeDBInstances",
-    "rds:ListTagsForResource",
-    "rds:AddTagsToResource"
-  ],
-  "Resource": "*"
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "rds:RestoreDBClusterToPointInTime",
+        "rds:CreateDBInstance",
+        "rds:DeleteDBInstance",
+        "rds:DeleteDBCluster",
+        "rds:DescribeDBClusters",
+        "rds:DescribeDBInstances",
+        "rds:ListTagsForResource",
+        "rds:AddTagsToResource",
+        "rds:RemoveTagsFromResource"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+### OIDC Trust Policy for the IAM Role
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:<org>/<repo>:*"
+        }
+      }
+    }
+  ]
 }
 ```
 
@@ -154,5 +208,9 @@ Every clone is tagged with:
 | Workflow not triggering | Ensure PR modifies `db-clone/config.yaml` |
 | Approval not appearing | Check `db-approval` environment config |
 | Clone creation fails | Verify AWS credentials and source DB exists |
-| Cleanup not running | Check scheduled workflow is enabled |
-| Cannot destroy | Verify cluster has required tags |
+| "Source DB does not exist" | Verify the `source_db` value matches an actual cluster in the region |
+| "Only aurora-mysql supported" | Source cluster must be Aurora MySQL, not PostgreSQL or standard RDS |
+| "Clone already exists for PR" | A previous run already created a clone; destroy it first or close the PR |
+| Cleanup not running | Check scheduled workflow is enabled in Actions tab |
+| Cannot destroy | Verify cluster has required tags (Platform, Expiry) |
+| Slack not working | Check `SLACK_WEBHOOK_URL` secret is set correctly |

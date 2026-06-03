@@ -133,9 +133,13 @@ jobs:
           echo "Cleanup scan complete for $REGION"
 
       - name: Notify Slack on Cleanup
-        if: ${{ vars.SLACK_WEBHOOK_URL != '' }}
         run: |
-          curl -X POST "${{ vars.SLACK_WEBHOOK_URL }}" \
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "Slack webhook not configured. Skipping notification."
+            exit 0
+          fi
+
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
             -H 'Content-type: application/json' \
             -d '{
               "text": "DB Clone TTL Cleanup completed for region: ${{ matrix.region }}"

@@ -44,8 +44,8 @@ Before deploying, ensure you have:
 }
 ```
 
-5. Name the role: `db-clone-github-actions-role`
-6. Copy the Role ARN (e.g., `arn:aws:iam::123456789012:role/db-clone-github-actions-role`)
+5. Name the role: `github-db-clone-role`
+6. Copy the Role ARN (e.g., `arn:aws:iam::<account-id>:role/github-db-clone-role`)
 
 ---
 
@@ -55,31 +55,52 @@ Before deploying, ensure you have:
 2. Provider type: OpenID Connect
 3. Provider URL: `https://token.actions.githubusercontent.com`
 4. Audience: `sts.amazonaws.com`
-5. Click Add Provider
+5. Click "Get thumbprint" (AWS fetches it automatically)
+6. Click Add Provider
+
+Then update the IAM Role trust policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:<org>/<repo>:*"
+        }
+      }
+    }
+  ]
+}
+```
+
+Replace `<account-id>`, `<org>`, and `<repo>` with your actual values.
 
 ---
 
 ### Step 3: Set Up GitHub Repository Secrets
 
-Go to your repo > Settings > Secrets and variables > Actions:
+Go to your repo > Settings > Secrets and variables > Actions > Secrets tab:
 
 | Secret | Value |
 |--------|-------|
-| `AWS_ROLE_ARN` | `arn:aws:iam::123456789012:role/db-clone-github-actions-role` |
-
----
-
-### Step 4: Set Up GitHub Repository Variables
-
-Go to your repo > Settings > Secrets and variables > Actions > Variables tab:
-
-| Variable | Value |
-|----------|-------|
+| `AWS_ROLE_ARN` | `arn:aws:iam::<account-id>:role/github-db-clone-role` |
 | `SLACK_WEBHOOK_URL` | Your Slack incoming webhook URL (optional) |
 
+NOTE: Slack is stored as a secret (not a variable) for security.
+
 ---
 
-### Step 5: Create the GitHub Environment with Approval Gate
+### Step 4: Create the GitHub Environment with Approval Gate
 
 1. Go to repo > Settings > Environments > New Environment
 2. Name: `db-approval`
@@ -89,26 +110,36 @@ Go to your repo > Settings > Secrets and variables > Actions > Variables tab:
 
 ---
 
-### Step 6: Push the Workflow Files
+### Step 5: Verify Repository Structure
 
-Ensure the following files are in your repository:
+Your repo must have this structure:
 
 ```
-db-clone/
-  config.yaml
-  .github/workflows/
-    db-clone-create.yml
-    db-clone-extend.yml
-    db-clone-destroy.yml
-    db-clone-pr-close.yml
-    db-clone-cleanup.yml
+<repo-root>/
++-- .github/workflows/
+|   +-- db-clone-create.yml
+|   +-- db-clone-extend.yml
+|   +-- db-clone-destroy.yml
+|   +-- db-clone-pr-close.yml
+|   +-- db-clone-cleanup.yml
++-- db-clone/
+|   +-- config.yaml
++-- .gitignore
++-- README.md
 ```
 
-Push to main branch:
+IMPORTANT:
+- `config.yaml` MUST be inside `db-clone/` folder (not at repo root)
+- `.github/workflows/` MUST be at repo root (GitHub Actions requirement)
+- Remove any `.DS_Store` or `__MACOSX/` files before committing
+
+---
+
+### Step 6: Push the Files
 
 ```bash
-git add db-clone/
-git commit -m "Add DB clone system workflows"
+git add .github/ db-clone/ .gitignore README.md
+git commit -m "Add DB clone system"
 git push origin main
 ```
 
@@ -122,11 +153,25 @@ git push origin main
 
 ---
 
+### Step 8: Verify All Workflows Have Correct Permissions
+
+Each workflow that uses AWS OIDC must have:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+```
+
+All workflows in this system already include this.
+
+---
+
 ## PART 2: END TO END TESTING
 
 ### Test 1: Create a Clone (Happy Path)
 
-**Goal:** Verify the full create flow works.
+**Goal:** Verify the full create flow works including new validations.
 
 ```bash
 # 1. Create a feature branch
@@ -152,9 +197,24 @@ gh pr create --title "DB Clone Request - Test" --body "Testing clone system"
 - Workflow "DB Clone - Create" appears in Actions tab
 - Status shows "Waiting" (pending approval)
 - Approve the deployment in the environment review
-- After approval, workflow runs through all steps
+- After approval, workflow runs through all steps:
+  - Parse Config
+  - Validate Inputs
+  - Generate Clone Name
+  - Calculate Expiry
+  - Configure AWS Credentials
+  - Validate Source DB Exists (NEW)
+  - Validate Source DB Engine (NEW)
+  - Prevent Duplicate Clone for PR (NEW)
+  - Create DB Cluster Clone
+  - Create DB Instance
+  - Wait for Cluster Available
+  - Wait for Instance Available
+  - Fetch Endpoint
+  - Comment on PR
+  - Notify Slack
 - PR gets a comment with cluster name, endpoint, and connection string
-- Slack notification is sent (if configured)
+- Slack notification is sent (if SLACK_WEBHOOK_URL secret is set)
 
 **Verification:**
 ```bash
@@ -206,7 +266,7 @@ SELECT COUNT(*) FROM some_table;
 
 ---
 
-### Test 3: Validation Failures
+### Test 3: Validation Failures (Input Validation)
 
 **Goal:** Verify input validation catches bad configs.
 
@@ -218,7 +278,7 @@ source_db: cm-mysql-cluster-prd-us-emailtrack
 ttl_hours: 72
 ```
 
-**Expected:** Workflow fails at "Validate Inputs" step with error message about TTL.
+**Expected:** Workflow fails at "Validate Inputs" step with: `ERROR: TTL cannot exceed 48 hours`
 
 #### Test 3b: Invalid region format
 
@@ -228,7 +288,7 @@ source_db: cm-mysql-cluster-prd-us-emailtrack
 ttl_hours: 24
 ```
 
-**Expected:** Workflow fails at "Validate Inputs" step with error about region format.
+**Expected:** Workflow fails at "Validate Inputs" step with: `ERROR: Invalid region format`
 
 #### Test 3c: Missing fields
 
@@ -236,11 +296,56 @@ ttl_hours: 24
 region: us-east-1
 ```
 
-**Expected:** Workflow fails at "Validate Inputs" step with error about missing fields.
+**Expected:** Workflow fails at "Validate Inputs" step with: `ERROR: Missing required fields`
 
 ---
 
-### Test 4: Extend TTL
+### Test 4: Source DB Validation (NEW)
+
+**Goal:** Verify source DB existence and engine checks work.
+
+#### Test 4a: Non-existent source DB
+
+```yaml
+region: us-east-1
+source_db: fake-database-that-doesnt-exist
+ttl_hours: 24
+```
+
+**Expected:** Workflow fails at "Validate Source DB Exists" with: `ERROR: Source DB 'fake-database-that-doesnt-exist' does not exist`
+
+#### Test 4b: Wrong engine (if you have a non-MySQL Aurora cluster)
+
+```yaml
+region: us-east-1
+source_db: some-postgresql-cluster
+ttl_hours: 24
+```
+
+**Expected:** Workflow fails at "Validate Source DB Engine" with: `ERROR: Only aurora-mysql is supported`
+
+---
+
+### Test 5: Duplicate Clone Prevention (NEW)
+
+**Goal:** Verify that a second clone cannot be created for the same PR.
+
+1. Complete Test 1 (clone already exists for a PR)
+2. Push another commit to the same PR branch:
+
+```bash
+git checkout feature/db-clone-test-1
+echo "# trigger" >> db-clone/config.yaml
+git add db-clone/config.yaml
+git commit -m "Trigger re-run"
+git push
+```
+
+**Expected:** Workflow fails at "Prevent Duplicate Clone for PR" with: `ERROR: A clone already exists for this PR`
+
+---
+
+### Test 6: Extend TTL
 
 **Goal:** Verify TTL extension works.
 
@@ -265,11 +370,11 @@ aws rds list-tags-for-resource \
 
 ---
 
-### Test 5: Manual Destroy
+### Test 7: Manual Destroy
 
 **Goal:** Verify manual destroy with safety checks.
 
-#### Test 5a: Destroy a valid clone
+#### Test 7a: Destroy a valid clone
 
 1. Go to Actions > "DB Clone - Destroy" > Run workflow
 2. Fill in:
@@ -283,7 +388,7 @@ aws rds list-tags-for-resource \
 - Cluster deleted
 - Summary printed
 
-#### Test 5b: Try to destroy a non-clone name
+#### Test 7b: Try to destroy a non-clone name
 
 1. Run "DB Clone - Destroy" with:
    - cluster_name: `production-database`
@@ -292,7 +397,7 @@ aws rds list-tags-for-resource \
 
 ---
 
-### Test 6: PR Close Auto-Destroy
+### Test 8: PR Close Auto-Destroy
 
 **Goal:** Verify auto-cleanup on PR close.
 
@@ -322,11 +427,11 @@ aws rds describe-db-clusters \
 
 ---
 
-### Test 7: TTL Cleanup (Scheduled)
+### Test 9: TTL Cleanup (Scheduled)
 
 **Goal:** Verify expired clones are automatically destroyed.
 
-Option A: Wait for the clone from Test 1 to expire (if TTL was set to 2 hours).
+Option A: Wait for a clone to expire (if TTL was set to 2 hours).
 
 Option B: Manually trigger the cleanup:
 1. Go to Actions > "DB Clone - TTL Cleanup" > Run workflow
@@ -341,33 +446,51 @@ Option B: Manually trigger the cleanup:
 **Verification:**
 ```bash
 # Check workflow logs for output like:
-# EXPIRED: xxx-clone-20250526-120000 (expired at 2025-05-26T14:00:00Z)
-# Destroyed: xxx-clone-20250526-120000
+# EXPIRED: xxx-clone-20250603-120000 (expired at 2025-06-03T14:00:00Z)
+# Destroyed: xxx-clone-20250603-120000
 ```
 
 ---
 
-### Test 8: Extend Validation Failures
+### Test 10: Extend Validation Failures
 
 **Goal:** Verify extend workflow rejects bad inputs.
 
-#### Test 8a: Non-clone name
+#### Test 10a: Non-clone name
 
 Run "DB Clone - Extend" with cluster_name: `production-db`
 
 **Expected:** Fails with error about missing '-clone-'.
 
-#### Test 8b: Extend beyond 48 hours
+#### Test 10b: Extend beyond 48 hours
 
 Run "DB Clone - Extend" with extend_hours: `72`
 
 **Expected:** Fails with error about max 48 hours.
 
-#### Test 8c: Non-existent cluster
+#### Test 10c: Non-existent cluster
 
 Run "DB Clone - Extend" with cluster_name: `fake-clone-12345`
 
 **Expected:** Fails at "Verify Clone Exists" step.
+
+---
+
+### Test 11: Slack Notification (Secret-based)
+
+**Goal:** Verify Slack notifications work using secrets.
+
+#### Test 11a: With SLACK_WEBHOOK_URL secret set
+
+- Complete a full clone creation
+- **Expected:** Slack message received with clone details
+
+#### Test 11b: Without SLACK_WEBHOOK_URL secret set
+
+- Remove or don't set the SLACK_WEBHOOK_URL secret
+- Complete a full clone creation
+- **Expected:** Workflow logs show "Slack webhook not configured. Skipping notification." and step passes (exit 0)
+
 
 ---
 
@@ -376,28 +499,39 @@ Run "DB Clone - Extend" with cluster_name: `fake-clone-12345`
 Use this checklist to confirm everything is working:
 
 ```
+DEPLOYMENT:
 [ ] IAM Role created with correct permissions
-[ ] OIDC provider configured in AWS
+[ ] OIDC provider configured in AWS (https://token.actions.githubusercontent.com)
+[ ] IAM Role trust policy restricts to your repo
 [ ] GitHub secret AWS_ROLE_ARN set
+[ ] GitHub secret SLACK_WEBHOOK_URL set (optional)
 [ ] GitHub environment db-approval created with reviewers
-[ ] Workflow files pushed to main branch
-[ ] Scheduled cleanup workflow enabled
+[ ] config.yaml is inside db-clone/ folder (not at repo root)
+[ ] .github/workflows/ is at repo root
+[ ] No .DS_Store or __MACOSX/ files in repo
+[ ] All workflows have permissions: id-token: write
+[ ] Scheduled cleanup workflow enabled in Actions tab
 
-[ ] Test 1: Clone creation - PASS
+TESTING:
+[ ] Test 1: Clone creation (happy path) - PASS
 [ ] Test 2: Clone connectivity - PASS
 [ ] Test 3a: TTL > 48h rejected - PASS
 [ ] Test 3b: Invalid region rejected - PASS
 [ ] Test 3c: Missing fields rejected - PASS
-[ ] Test 4: TTL extension works - PASS
-[ ] Test 5a: Manual destroy works - PASS
-[ ] Test 5b: Non-clone name rejected - PASS
-[ ] Test 6: PR close auto-destroy - PASS
-[ ] Test 7: TTL cleanup finds expired - PASS
-[ ] Test 8a: Extend non-clone rejected - PASS
-[ ] Test 8b: Extend > 48h rejected - PASS
-[ ] Test 8c: Extend non-existent rejected - PASS
+[ ] Test 4a: Non-existent source DB rejected - PASS
+[ ] Test 4b: Wrong engine rejected - PASS
+[ ] Test 5: Duplicate clone for same PR rejected - PASS
+[ ] Test 6: TTL extension works - PASS
+[ ] Test 7a: Manual destroy works - PASS
+[ ] Test 7b: Non-clone name rejected - PASS
+[ ] Test 8: PR close auto-destroy - PASS
+[ ] Test 9: TTL cleanup finds expired - PASS
+[ ] Test 10a: Extend non-clone rejected - PASS
+[ ] Test 10b: Extend > 48h rejected - PASS
+[ ] Test 10c: Extend non-existent rejected - PASS
+[ ] Test 11a: Slack notification received - PASS
+[ ] Test 11b: Slack skipped gracefully when not configured - PASS
 
-[ ] Slack notifications received (if configured)
 [ ] PR comments posted correctly
 [ ] All clones cleaned up after testing
 ```
@@ -408,13 +542,17 @@ Use this checklist to confirm everything is working:
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| Workflow not triggered | PR does not modify `db-clone/config.yaml` | Ensure the file path matches exactly |
-| "Waiting for deployment" forever | No one approved | Check environment reviewers |
-| AWS credential error | Role ARN wrong or trust policy incorrect | Verify OIDC config and role trust |
-| Clone creation timeout | Source DB too large or region issue | Check RDS console for status |
+| Workflow not triggered | PR does not modify `db-clone/config.yaml` | Ensure config is in `db-clone/` folder, not repo root |
+| "Waiting for deployment" forever | No one approved | Check `db-approval` environment reviewers |
+| AWS credential error | Role ARN wrong or trust policy incorrect | Verify OIDC config and role trust policy |
+| "Source DB does not exist" | `source_db` value is wrong | Check the actual cluster name in AWS RDS console |
+| "Only aurora-mysql supported" | Source is PostgreSQL or standard RDS | Only Aurora MySQL clusters can be cloned |
+| "Clone already exists for PR" | Previous run already created one | Destroy the existing clone first, or close and reopen PR |
+| Clone creation timeout | Source DB too large or region issue | Check RDS console for clone status |
 | Cleanup not running | Scheduled workflow disabled | Enable in Actions tab |
-| Destroy fails on tags | Clone was created before tagging was added | Manually delete via AWS console |
-| Slack not working | Webhook URL not set or invalid | Check SLACK_WEBHOOK_URL variable |
+| Destroy fails on tags | Cluster missing required tags | Manually delete via AWS console |
+| Slack not working | `SLACK_WEBHOOK_URL` secret not set or invalid | Check secret value in repo settings |
+| Config at wrong path | `config.yaml` is at repo root | Move it to `db-clone/config.yaml` |
 
 ---
 
