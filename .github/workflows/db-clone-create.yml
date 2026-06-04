@@ -375,7 +375,11 @@ jobs:
             --db-snapshot-identifier "$SNAPSHOT_NAME" \
             --tags \
               Key=Platform,Value=developer-tools \
-              Key=ManagedBy,Value=db-clone-system
+              Key=ManagedBy,Value=db-clone-system \
+              Key=Requester,Value=${{ github.actor }} \
+              Key=PR,Value=${{ github.event.pull_request.number }} \
+              Key=Expiry,Value="$EXPIRY" \
+              Key=SourceDB,Value="$SOURCE_DB"
 
           echo "Waiting for snapshot to become available..."
           aws rds wait db-snapshot-available \
@@ -405,6 +409,65 @@ jobs:
             --region "$REGION" \
             --db-instance-identifier "$CLONE_NAME"
           echo "Instance is available"
+
+      # -------------------------------------------
+      # 9a. Partial Failure Cleanup - Aurora
+      # -------------------------------------------
+      - name: Cleanup on Failure - Aurora Cluster
+        if: failure() && steps.config.outputs.source_type == 'aurora-cluster'
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          CLONE_NAME="${{ steps.clone_name.outputs.clone_name }}"
+          INSTANCE_NAME="${{ steps.clone_name.outputs.instance_name }}"
+
+          echo "Partial failure detected. Cleaning up Aurora resources..."
+
+          # Try to delete instance if it was created
+          aws rds delete-db-instance \
+            --region "$REGION" \
+            --db-instance-identifier "$INSTANCE_NAME" \
+            --skip-final-snapshot 2>/dev/null || true
+
+          aws rds wait db-instance-deleted \
+            --region "$REGION" \
+            --db-instance-identifier "$INSTANCE_NAME" 2>/dev/null || true
+
+          # Try to delete cluster if it was created
+          aws rds delete-db-cluster \
+            --region "$REGION" \
+            --db-cluster-identifier "$CLONE_NAME" \
+            --skip-final-snapshot 2>/dev/null || true
+
+          echo "Cleanup attempted for Aurora partial failure."
+
+      # -------------------------------------------
+      # 9b. Partial Failure Cleanup - RDS Instance
+      # -------------------------------------------
+      - name: Cleanup on Failure - RDS Instance
+        if: failure() && steps.config.outputs.source_type == 'rds-instance'
+        run: |
+          REGION="${{ steps.config.outputs.region }}"
+          CLONE_NAME="${{ steps.clone_name.outputs.clone_name }}"
+          SNAPSHOT_NAME="${{ steps.clone_name.outputs.snapshot_name }}"
+
+          echo "Partial failure detected. Cleaning up RDS resources..."
+
+          # Try to delete restored instance if it was created
+          aws rds delete-db-instance \
+            --region "$REGION" \
+            --db-instance-identifier "$CLONE_NAME" \
+            --skip-final-snapshot 2>/dev/null || true
+
+          aws rds wait db-instance-deleted \
+            --region "$REGION" \
+            --db-instance-identifier "$CLONE_NAME" 2>/dev/null || true
+
+          # Try to delete snapshot if it was created
+          aws rds delete-db-snapshot \
+            --region "$REGION" \
+            --db-snapshot-identifier "$SNAPSHOT_NAME" 2>/dev/null || true
+
+          echo "Cleanup attempted for RDS partial failure."
 
       # -------------------------------------------
       # 10. Fetch Endpoint
@@ -479,8 +542,17 @@ jobs:
             | **Requester** | @${{ github.actor }} |
 
             ### Connection
+
+            Use the appropriate client for the engine:
+
+            **mysql / aurora-mysql:**
             \`\`\`
             mysql -h ${endpoint} -P ${port} -u <username> -p
+            \`\`\`
+
+            **postgres / aurora-postgresql:**
+            \`\`\`
+            psql -h ${endpoint} -p ${port} -U <username> -d <dbname>
             \`\`\`
 
             ### Notes
